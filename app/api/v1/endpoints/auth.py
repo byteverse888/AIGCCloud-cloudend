@@ -209,6 +209,7 @@ async def login(request: LoginRequest):
             "role": user_data.get("role", "user"),
             "level": user_data.get("level", 1),
             "memberLevel": user_data.get("memberLevel", "normal"),
+            "memberExpireAt": user_data.get("memberExpireAt"),
             "coins": user_data.get("coins", 0),  # 金币余额
             "avatar": user_data.get("avatar"),
             "avatarKey": user_data.get("avatarKey"),
@@ -851,6 +852,7 @@ def _build_user_response(user_data: dict, session_token: str, address: str):
         "role": user_data.get("role", "user"),
         "level": user_data.get("level", 1),
         "memberLevel": user_data.get("memberLevel", "normal"),
+        "memberExpireAt": user_data.get("memberExpireAt"),
         "coins": user_data.get("coins", 0),
         "avatar": user_data.get("avatar"),
         "avatarKey": user_data.get("avatarKey"),

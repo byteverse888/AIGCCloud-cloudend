@@ -86,9 +86,10 @@ async def subscribe_member(request: SubscribeRequest):
     
     流程:
     1. 验证套餐
-    2. 创建订单记录
-    3. 调用微信支付
-    4. 返回支付参数
+    2. 检查是否允许购买（禁止降级）
+    3. 创建订单记录
+    4. 调用微信支付
+    5. 返回支付参数
     """
     # 1. 验证套餐
     plan = MEMBER_PLANS.get(request.plan_id)
@@ -110,7 +111,36 @@ async def subscribe_member(request: SubscribeRequest):
         logger.error(f"[会员订阅] 验证用户失败: {e}")
         raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
     
-    # 3. 创建订单
+    # 3. 检查是否允许购买（禁止活跃会员降级购买）
+    current_level = user.get("memberLevel", "normal")
+    current_expire = user.get("memberExpireAt")
+    new_level = plan.get("level", "vip")
+    
+    # 等级优先级: svip > vip > normal
+    LEVEL_PRIORITY = {"normal": 0, "vip": 1, "svip": 2}
+    current_priority = LEVEL_PRIORITY.get(current_level, 0)
+    new_priority = LEVEL_PRIORITY.get(new_level, 0)
+    
+    # 检查当前会员是否有效
+    is_active = False
+    if current_expire:
+        try:
+            expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
+            if expire_dt.tzinfo:
+                expire_dt = expire_dt.replace(tzinfo=None)
+            is_active = expire_dt > datetime.now()
+        except Exception as e:
+            logger.warning(f"[会员订阅] 解析到期时间失败: {e}")
+    
+    # 禁止降级购买
+    if is_active and new_priority < current_priority:
+        logger.warning(f"[会员订阅] 禁止降级: 当前{current_level}未过期，不能购买{new_level}")
+        return SubscribeResponse(
+            success=False,
+            message=f"您当前是{current_level.upper()}会员，有效期至{expire_dt.date()}，请等到期后再购买{new_level.upper()}"
+        )
+    
+    # 4. 创建订单
     order_id = f"MO{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
     order_data = {
         "orderId": order_id,
@@ -131,7 +161,7 @@ async def subscribe_member(request: SubscribeRequest):
         logger.error(f"[会员订阅] 创建订单失败: {e}")
         raise HTTPException(status_code=500, detail="创建订单失败")
     
-    # 4. 创建微信支付
+    # 5. 创建微信支付
     total_fee = int(plan["price"] * 100)  # 转为分
     pay_result = await wechat_pay.create_order(
         out_trade_no=order_id,
@@ -153,7 +183,7 @@ async def subscribe_member(request: SubscribeRequest):
             message=pay_result.get("error", "支付创建失败"),
         )
     
-    # 5. 更新订单支付信息
+    # 6. 更新订单支付信息
     await parse_client.query_and_update(
         "MemberOrder",
         {"orderId": order_id},
@@ -258,6 +288,7 @@ async def get_member_status(
     if member_expire_at:
         expire_dt = datetime.fromisoformat(member_expire_at.replace("Z", "+00:00"))
         is_expired = expire_dt < datetime.now(expire_dt.tzinfo)
+        # 会员过期后自动降级为普通用户
         if is_expired:
             member_level = "normal"
     
@@ -350,32 +381,64 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
         logger.error(f"[会员订阅] 用户不存在: {user_id}")
         return SubscribeResponse(success=False, message="用户不存在")
     
-    # 3. 计算新的到期时间
+    # 3. 计算新的到期时间（简化方案）
+    # 规则：
+    # - 同等级续费：时间累加
+    # - 升级(VIP→SVIP)：折算剩余时间 + 新购时间
+    # - 降级(SVIP→VIP)：当前会员未过期时，禁止降级购买
+    # - 首次开通/已过期：直接购买
+    
     current_expire = user.get("memberExpireAt")
     current_level = user.get("memberLevel", "normal")
     new_level = plan.get("level", "vip")
     days = plan.get("days", 30)
     
+    # 等级优先级: svip > vip > normal
+    LEVEL_PRIORITY = {"normal": 0, "vip": 1, "svip": 2}
+    current_priority = LEVEL_PRIORITY.get(current_level, 0)
+    new_priority = LEVEL_PRIORITY.get(new_level, 0)
+    
     now = datetime.now()
+    is_active = False  # 当前会员是否有效
+    
     if current_expire:
-        # 有现有会员
         expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
         if expire_dt.tzinfo:
             expire_dt = expire_dt.replace(tzinfo=None)
+        is_active = expire_dt > now
+    
+    # 检查是否为降级购买
+    if is_active and new_priority < current_priority:
+        # 高等级会员未过期，禁止购买低等级
+        logger.warning(f"[会员订阅] 禁止降级: 当前{current_level}未过期({expire_dt.date()})，不能购买{new_level}")
+        return SubscribeResponse(
+            success=False, 
+            message=f"您当前是{current_level.upper()}会员，有效期至{expire_dt.date()}，请等到期后再购买{new_level.upper()}"
+        )
+    
+    # 计算新到期时间
+    if is_active:
+        remaining_days = (expire_dt - now).days
         
-        if expire_dt > now:
-            if current_level == new_level:
-                # 同等级续费，时间累加
-                new_expire = expire_dt + timedelta(days=days)
-            else:
-                # 不同等级，从现在开始
-                new_expire = now + timedelta(days=days)
+        if current_level == new_level:
+            # 同等级续费，时间直接累加
+            new_expire = expire_dt + timedelta(days=days)
+            logger.info(f"[会员订阅] 同等级续费: 剩余{remaining_days}天 + 新购{days}天")
         else:
-            # 已过期，从现在开始
-            new_expire = now + timedelta(days=days)
+            # 升级：折算剩余时间 + 新购时间
+            # VIP→SVIP: VIP剩余时间按1:2折算（因为SVIP是VIP 2倍价格）
+            # 例: 30天VIP = 15天SVIP
+            PRICE_RATIO = {"vip": 1.0, "svip": 2.0}
+            current_ratio = PRICE_RATIO.get(current_level, 1.0)
+            new_ratio = PRICE_RATIO.get(new_level, 1.0)
+            converted_days = int(remaining_days * current_ratio / new_ratio)
+            new_expire = now + timedelta(days=converted_days + days)
+            logger.info(f"[会员订阅] 升级: {current_level}->{new_level}, "
+                       f"剩余{remaining_days}天折算为{converted_days}天 + 新购{days}天")
     else:
-        # 首次开通
+        # 首次开通或已过期，从现在开始
         new_expire = now + timedelta(days=days)
+        logger.info(f"[会员订阅] {'首次开通' if not current_expire else '会员已过期'}，{days}天")
     
     # 4. 更新用户会员状态
     update_data = {
@@ -394,7 +457,7 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
         logger.error(f"[会员订单] 更新用户会员状态失败: {e}")
         return SubscribeResponse(success=False, message="更新会员状态失败")
     
-    logger.info(f"[会员订阅] 用户 {user_id} 升级为 {new_level}，到期时间: {new_expire}")
+    logger.info(f"[会员订阅] 用户 {user_id} 会员等级: {new_level}，到期时间: {new_expire}")
     
     # 5. 发放积分奖励
     bonus = plan.get("bonus", 0)
