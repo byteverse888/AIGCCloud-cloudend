@@ -39,8 +39,13 @@ class Settings(BaseSettings):
     wechat_app_id: str = "wx_test_appid"
     wechat_mch_id: str = "1234567890"
     wechat_api_key: str = "test_api_key_32chars_placeholder"
-    wechat_notify_url: str = "http://localhost:8000/api/v1/payment/callback/wechat"
+    wechat_notify_url: str = "http://localhost:8000/api/v1/member/callback/wechat"
     wechat_test_mode: bool = True  # 测试模式，允许模拟支付
+    
+    # WeChat Pay API v3 (生产环境推荐)
+    wechat_api_v3_key: str = ""  # API v3 密钥 (32字节)
+    wechat_serial_no: str = ""   # 商户API证书序列号
+    wechat_private_key_path: str = ""  # 商户私钥文件路径 (apiclient_key.pem)
 
     # Web3 运营账户（用于发放金币激励）
     web3_operator_private_key: str = "0x0000000000000000000000000000000000000000000000000000000000000001"
