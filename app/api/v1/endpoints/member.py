@@ -330,6 +330,70 @@ async def get_member_orders(
     return {"orders": orders, "total": len(orders)}
 
 
+@router.get("/order-status/{order_id}")
+async def get_order_status(
+    order_id: str,
+    x_parse_session_token: Optional[str] = Header(None, alias="X-Parse-Session-Token")
+):
+    """
+    查询订单支付状态（用于支付后轮询）
+    
+    真实支付流程中，前端展示二维码后需要轮询此接口检查支付结果
+    """
+    if not x_parse_session_token:
+        raise HTTPException(status_code=401, detail="未提供会话令牌")
+    
+    try:
+        user = await parse_client.get_current_user(x_parse_session_token)
+    except Exception as e:
+        logger.error(f"[订单状态] 验证用户失败: {e}")
+        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+    
+    # 查询订单
+    result = await parse_client.query_objects(
+        "MemberOrder",
+        where={"orderId": order_id},
+        limit=1,
+    )
+    orders = result.get("results", [])
+    
+    if not orders:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    
+    order = orders[0]
+    
+    # 验证订单属于当前用户
+    if order.get("userId") != user.get("objectId"):
+        raise HTTPException(status_code=403, detail="无权访问此订单")
+    
+    # 如果订单状态是 pending，调用微信支付查询接口确认真实状态
+    if order.get("status") == "pending":
+        try:
+            pay_result = await wechat_pay.query_order(order_id)
+            if pay_result.get("trade_state") == "SUCCESS":
+                # 支付成功，更新订单并完成订阅
+                await parse_client.query_and_update(
+                    "MemberOrder",
+                    {"orderId": order_id},
+                    {"status": "paid", "paidAt": datetime.now().isoformat()},
+                )
+                # 完成会员订阅
+                await complete_member_order(order_id, order)
+                return {
+                    "order_id": order_id,
+                    "status": "paid",
+                    "paid_at": datetime.now().isoformat(),
+                }
+        except Exception as e:
+            logger.error(f"[订单状态] 查询微信支付失败: {e}")
+    
+    return {
+        "order_id": order_id,
+        "status": order.get("status", "pending"),
+        "paid_at": order.get("paidAt"),
+    }
+
+
 # ============ 内部函数 ============
 
 async def complete_member_order(order_id: str, order: dict, session_token: Optional[str] = None) -> SubscribeResponse:

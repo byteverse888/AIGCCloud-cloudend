@@ -78,6 +78,8 @@ class WechatPay:
         self.api_key = settings.wechat_api_key
         self.notify_url = settings.wechat_notify_url
         self.test_mode = settings.wechat_test_mode
+        # 启动时记录配置，便于调试
+        logger.info(f"[微信支付] 初始化: test_mode={self.test_mode}, mch_id={self.mch_id[:4]}***")
     
     async def create_order(
         self,
@@ -102,6 +104,10 @@ class WechatPay:
         Returns:
             prepay_id 等支付参数
         """
+        # 调试日志
+        logger.info(f"[DEBUG] test_mode={self.test_mode}, type={type(self.test_mode)}")
+        logger.info(f"[DEBUG] app_id={self.app_id[:10]}..., mch_id={self.mch_id}")
+        
         # 测试模式：返回模拟数据
         if self.test_mode:
             logger.info(f"[微信支付-测试模式] 创建订单: {out_trade_no}, 金额: {total_fee}分")
