@@ -71,6 +71,12 @@ class Web3LoginRequest(BaseModel):
     captcha_text: Optional[str] = None  # 验证码文本（注册时必填）
 
 
+class Web3SimpleLoginRequest(BaseModel):
+    """Web3 地址+密码简单登录请求（无需签名，适用于已注册用户）"""
+    address: str
+    password: str
+
+
 class LoginResponse(BaseModel):
     success: bool
     token: str  # FastAPI JWT Token
@@ -1032,6 +1038,77 @@ async def web3_login(request: Web3LoginRequest):
             logger.warning(f"[Web3] 登录失败: {address[:10]}... - status={response.status_code}, error={error_text}")
             raise HTTPException(status_code=401, detail="登录失败，请检查账户和密码")
 
+
+
+@router.post("/web3/simple-login")
+async def web3_simple_login(request: Web3SimpleLoginRequest):
+    """
+    Web3 简单登录 - 仅需地址+密码（无需签名）
+    适用于已注册用户的快速登录，免去私钥签名步骤
+    """
+    import httpx
+    
+    logger.info(f"[Web3] 简单登录请求: {request.address[:10]}...")
+    
+    address = validate_eth_address(request.address)
+    username = address.lower()
+    
+    if not request.password or len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少6位")
+    
+    # 直接调用 Parse 登录
+    login_url = f"{settings.parse_server_url}/login"
+    login_headers = {
+        "X-Parse-Application-Id": settings.parse_app_id,
+        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
+        "X-Parse-Revocable-Session": "1",
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            login_url,
+            params={"username": username, "password": request.password},
+            headers=login_headers,
+            timeout=30.0
+        )
+    
+    if response.status_code == 200:
+        user_data = response.json()
+        session_token = user_data.get("sessionToken")
+        user_id = user_data.get("objectId")
+        
+        logger.info(f"[Web3] 简单登录成功: {address[:10]}... (ID: {user_id})")
+        
+        if session_token and user_id:
+            await _update_last_login(user_id, session_token, address)
+        
+        jwt_token = create_access_token(data={
+            "sub": user_id,
+            "user_id": user_id,
+            "address": address,
+            "session_token": session_token,
+            "parse_session": session_token,
+        })
+        
+        safe_user, parse_config = _build_user_response(user_data, session_token, address)
+        
+        return {
+            "success": True,
+            "token": jwt_token,
+            "user": safe_user,
+            "parse_config": parse_config,
+            "is_new_user": False,
+            "message": "登录成功"
+        }
+    else:
+        try:
+            error_data = response.json()
+            error_code = error_data.get("code")
+            if error_code == 101:
+                raise HTTPException(status_code=401, detail="地址未注册或密码错误")
+            raise HTTPException(status_code=401, detail=error_data.get("error", "登录失败"))
+        except ValueError:
+            raise HTTPException(status_code=401, detail="登录失败，请检查账户和密码")
 
 
 @router.post("/web3/logout")

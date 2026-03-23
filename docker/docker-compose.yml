@@ -107,14 +107,16 @@ services:
       PARSE_SERVER_MOUNT_PATH: /parse
       PARSE_SERVER_ALLOW_CLIENT_CLASS_CREATION: "false"
       PARSE_SERVER_MASTER_KEY_IPS: "172.0.0.0/8,10.0.0.0/8,192.168.0.0/16"
+      PARSE_SERVER_LOG_LEVEL: info
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:1337/parse/health"]
-      interval: 30s
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:1337/parse/health"]
+      interval: 60s
       timeout: 10s
       retries: 5
+      start_period: 60s
 
   # Parse Dashboard
   parse-dashboard:
@@ -149,6 +151,8 @@ services:
       PARSE_SERVER_URL: http://parse-server:1337/parse
       PARSE_APP_ID: ${PARSE_APP_ID:-aigccloud}
       PARSE_MASTER_KEY: ${PARSE_MASTER_KEY:-masterkey123}
+      PARSE_REST_API_KEY: ${PARSE_REST_API_KEY:-restapi_service_key}
+      PARSE_JS_KEY: ${PARSE_JS_KEY:-jskey_client}
       SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
       DEBUG: ${DEBUG:-false}
       # S3 对象存储配置
