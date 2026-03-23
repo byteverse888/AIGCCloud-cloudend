@@ -339,41 +339,34 @@ class ParseClient:
     REQUIRED_CLASSES = ["Order", "Product", "MemberOrder", "AITask", "Incentive", "IncentiveLog"]
     
     async def ensure_schema(self):
-        """确保所有业务类在 Parse Server 中存在（用 Master Key 创建）"""
-        for class_name in self.REQUIRED_CLASSES:
-            try:
-                async with httpx.AsyncClient() as client:
-                    # 用 Master Key 查询，如果类不存在会返回空结果而非报错
-                    response = await client.get(
-                        f"{self.base_url}/classes/{class_name}",
+        """确保所有业务类在 Parse Server 中存在（用 Schema API + Master Key）"""
+        async with httpx.AsyncClient() as client:
+            for class_name in self.REQUIRED_CLASSES:
+                try:
+                    # 用 Schema API 检查类是否存在
+                    resp = await client.get(
+                        f"{self.base_url}/schemas/{class_name}",
                         headers=self.master_headers,
-                        params={"limit": "0"},
                         timeout=10.0,
                     )
-                    if response.status_code == 200:
+                    if resp.status_code == 200:
                         logger.debug(f"[Parse] Schema OK: {class_name}")
+                        continue
+                    
+                    # 类不存在，通过 Schema API 创建
+                    logger.info(f"[Parse] 创建 Schema: {class_name}")
+                    create_resp = await client.post(
+                        f"{self.base_url}/schemas/{class_name}",
+                        headers=self.master_headers,
+                        json={"className": class_name},
+                        timeout=10.0,
+                    )
+                    if create_resp.status_code in (200, 201):
+                        logger.info(f"[Parse] Schema 创建成功: {class_name}")
                     else:
-                        # 类不存在，创建一个空对象再删除，触发自动建类
-                        logger.info(f"[Parse] 创建 Schema: {class_name}")
-                        create_resp = await client.post(
-                            f"{self.base_url}/classes/{class_name}",
-                            headers=self.master_headers,
-                            json={"_schema_init": True},
-                            timeout=10.0,
-                        )
-                        if create_resp.status_code in (200, 201):
-                            obj_id = create_resp.json().get("objectId")
-                            if obj_id:
-                                await client.delete(
-                                    f"{self.base_url}/classes/{class_name}/{obj_id}",
-                                    headers=self.master_headers,
-                                    timeout=10.0,
-                                )
-                            logger.info(f"[Parse] Schema 创建成功: {class_name}")
-                        else:
-                            logger.error(f"[Parse] Schema 创建失败: {class_name} - {create_resp.text}")
-            except Exception as e:
-                logger.error(f"[Parse] ensure_schema 异常({class_name}): {e}")
+                        logger.error(f"[Parse] Schema 创建失败: {class_name} - {create_resp.text}")
+                except Exception as e:
+                    logger.error(f"[Parse] ensure_schema 异常({class_name}): {e}")
     
     # ============ 辅助方法 ============
     
