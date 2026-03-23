@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.core.redis_client import redis_client
 from app.core.logger import logger
 from app.core.arq_worker import get_arq_pool, close_arq_pool
+from app.core.parse_client import parse_client
 from app.api.v1 import router as api_v1_router
 
 # ARQ Worker 实例
@@ -28,6 +29,13 @@ async def lifespan(app: FastAPI):
         logger.info("Redis connected successfully")
     except Exception as e:
         logger.error(f"Redis connection failed: {e}")
+    
+    # 初始化 Parse Schema（确保所有业务类存在）
+    try:
+        await parse_client.ensure_schema()
+        logger.info("Parse Schema 初始化完成")
+    except Exception as e:
+        logger.error(f"Parse Schema 初始化失败: {e}")
     
     # 初始化 ARQ 连接池
     try:
