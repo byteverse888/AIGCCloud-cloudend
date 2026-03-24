@@ -416,7 +416,7 @@ class ParseClient:
     }
     
     async def ensure_schema(self):
-        """确保所有业务类在 Parse Server 中存在并包含必要字段（Schema API + Master Key）"""
+        """确保所有业务类在 Parse Server 中存在并包含正确类型的字段（Schema API + Master Key）"""
         async with httpx.AsyncClient() as client:
             for class_name, fields in self.SCHEMA_DEFINITIONS.items():
                 try:
@@ -427,21 +427,44 @@ class ParseClient:
                         timeout=10.0,
                     )
                     if resp.status_code == 200:
-                        # 类已存在，检查是否缺少字段
                         existing = resp.json().get("fields", {})
-                        missing = {k: v for k, v in fields.items() if k not in existing}
+                        missing = {}
+                        type_mismatch = {}
+                        for k, v in fields.items():
+                            if k not in existing:
+                                missing[k] = v
+                            elif existing[k].get("type") != v.get("type"):
+                                type_mismatch[k] = v
+                        
+                        # 先删除类型不匹配的字段，再重新添加
+                        if type_mismatch:
+                            logger.warning(f"[Parse] 字段类型不匹配 {class_name}: {list(type_mismatch.keys())}")
+                            delete_fields = {k: {"__op": "Delete"} for k in type_mismatch}
+                            del_resp = await client.put(
+                                f"{self.base_url}/schemas/{class_name}",
+                                headers=self.master_headers,
+                                json={"className": class_name, "fields": delete_fields},
+                                timeout=10.0,
+                            )
+                            if del_resp.status_code == 200:
+                                missing.update(type_mismatch)
+                                logger.info(f"[Parse] 旧字段已删除，将重建: {list(type_mismatch.keys())}")
+                            else:
+                                logger.error(f"[Parse] 删除字段失败: {class_name} - {del_resp.text}")
+                        
+                        # 添加缺少的字段（含类型修复后重建的）
                         if missing:
                             logger.info(f"[Parse] 补充字段 {class_name}: {list(missing.keys())}")
-                            update_resp = await client.put(
+                            add_resp = await client.put(
                                 f"{self.base_url}/schemas/{class_name}",
                                 headers=self.master_headers,
                                 json={"className": class_name, "fields": missing},
                                 timeout=10.0,
                             )
-                            if update_resp.status_code == 200:
+                            if add_resp.status_code == 200:
                                 logger.info(f"[Parse] 字段补充成功: {class_name}")
                             else:
-                                logger.error(f"[Parse] 字段补充失败: {class_name} - {update_resp.text}")
+                                logger.error(f"[Parse] 字段补充失败: {class_name} - {add_resp.text}")
                         else:
                             logger.debug(f"[Parse] Schema OK: {class_name}")
                         continue
