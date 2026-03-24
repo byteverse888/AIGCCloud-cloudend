@@ -335,13 +335,90 @@ class ParseClient:
     
     # ============ Schema 初始化 ============
     
-    # 项目中用到的所有 Parse 业务类
-    REQUIRED_CLASSES = ["Order", "Product", "MemberOrder", "AITask", "Incentive", "IncentiveLog"]
+    # 项目中用到的所有 Parse 业务类及其字段定义
+    SCHEMA_DEFINITIONS: Dict[str, Dict] = {
+        "Order": {
+            "orderNo": {"type": "String"},
+            "userId": {"type": "String"},
+            "type": {"type": "String"},
+            "amount": {"type": "Number"},
+            "coins": {"type": "Number"},
+            "status": {"type": "String"},
+            "description": {"type": "String"},
+            "paymentMethod": {"type": "String"},
+            "plan": {"type": "String"},
+            "productId": {"type": "String"},
+            "productName": {"type": "String"},
+            "buyerAddress": {"type": "String"},
+            "sellerAddress": {"type": "String"},
+            "txHash": {"type": "String"},
+            "paidAt": {"type": "String"},
+            "completedAt": {"type": "String"},
+            "failReason": {"type": "String"}
+        },
+        "Product": {
+            "owner": {"type": "String"},
+            "status": {"type": "String"},
+            "category": {"type": "String"},
+            "creatorId": {"type": "String"},
+            "reportCount": {"type": "Number"},
+            "reviewedAt": {"type": "String"},
+            "reviewedBy": {"type": "String"},
+            "reviewNote": {"type": "String"},
+            "offlineReason": {"type": "String"}
+        },
+        "MemberOrder": {
+            "orderId": {"type": "String"},
+            "userId": {"type": "String"},
+            "planId": {"type": "String"},
+            "planName": {"type": "String"},
+            "level": {"type": "String"},
+            "days": {"type": "Number"},
+            "amount": {"type": "Number"},
+            "bonus": {"type": "Number"},
+            "status": {"type": "String"},
+            "failReason": {"type": "String"}
+        },
+        "AITask": {
+            "taskId": {"type": "String"},
+            "designer": {"type": "String"},
+            "executor": {"type": "String"},
+            "type": {"type": "String"},
+            "model": {"type": "String"},
+            "data": {"type": "Object"},
+            "status": {"type": "String"},
+            "cost": {"type": "Number"},
+            "results": {"type": "Array"},
+            "errorMessage": {"type": "String"},
+            "rewardAmount": {"type": "Number"},
+            "rewardTxHash": {"type": "String"},
+            "claimedAt": {"type": "String"},
+            "startedAt": {"type": "String"},
+            "completedAt": {"type": "String"},
+            "error": {"type": "String"}
+        },
+        "Incentive": {
+            "userId": {"type": "String"},
+            "type": {"type": "String"},
+            "amount": {"type": "Number"},
+            "description": {"type": "String"}
+        },
+        "IncentiveLog": {
+            "userId": {"type": "String"},
+            "web3Address": {"type": "String"},
+            "type": {"type": "String"},
+            "amount": {"type": "Number"},
+            "txHash": {"type": "String"},
+            "description": {"type": "String"},
+            "status": {"type": "String"},
+            "relatedId": {"type": "String"}
+        }
+    }
     
     async def ensure_schema(self):
-        """确保所有业务类在 Parse Server 中存在（用 Schema API + Master Key）"""
+        """确保所有业务类在 Parse Server 中存在并包含必要字段（Schema API + Master Key）"""
         async with httpx.AsyncClient() as client:
-            for class_name in self.REQUIRED_CLASSES:
+            for class_name, fields in self.SCHEMA_DEFINITIONS.items():
                 try:
                     # 用 Schema API 检查类是否存在
                     resp = await client.get(
@@ -350,15 +427,31 @@ class ParseClient:
                         timeout=10.0,
                     )
                     if resp.status_code == 200:
-                        logger.debug(f"[Parse] Schema OK: {class_name}")
+                        # 类已存在，检查是否缺少字段
+                        existing = resp.json().get("fields", {})
+                        missing = {k: v for k, v in fields.items() if k not in existing}
+                        if missing:
+                            logger.info(f"[Parse] 补充字段 {class_name}: {list(missing.keys())}")
+                            update_resp = await client.put(
+                                f"{self.base_url}/schemas/{class_name}",
+                                headers=self.master_headers,
+                                json={"className": class_name, "fields": missing},
+                                timeout=10.0,
+                            )
+                            if update_resp.status_code == 200:
+                                logger.info(f"[Parse] 字段补充成功: {class_name}")
+                            else:
+                                logger.error(f"[Parse] 字段补充失败: {class_name} - {update_resp.text}")
+                        else:
+                            logger.debug(f"[Parse] Schema OK: {class_name}")
                         continue
                     
-                    # 类不存在，通过 Schema API 创建
+                    # 类不存在，创建并带上字段定义
                     logger.info(f"[Parse] 创建 Schema: {class_name}")
                     create_resp = await client.post(
                         f"{self.base_url}/schemas/{class_name}",
                         headers=self.master_headers,
-                        json={"className": class_name},
+                        json={"className": class_name, "fields": fields},
                         timeout=10.0,
                     )
                     if create_resp.status_code in (200, 201):
