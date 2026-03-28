@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     wechat_mch_id: str = "1234567890"
     wechat_api_key: str = "test_api_key_32chars_placeholder"
     wechat_notify_url: str = "http://localhost:8000/api/v1/member/callback/wechat"
-    wechat_test_mode: bool = True  # 测试模式，允许模拟支付
+    wechat_test_mode: bool = False  # 测试模式，允许模拟支付
     
     # WeChat Pay API v3 (生产环境推荐)
     wechat_api_v3_key: str = ""  # API v3 密钥 (32字节)
