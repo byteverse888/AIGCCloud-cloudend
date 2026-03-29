@@ -485,11 +485,19 @@ async def get_current_user(user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=404, detail="User not found")
 
 
+# 已知的子路由名，防止被 /{user_id} 通配误匹配
+_RESERVED_PATHS = {"me", "register", "register-phone", "activate", "forgot-password",
+                   "reset-password", "change-password", "bind-web3", "verify-web3",
+                   "admin", "wallet"}
+
+
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(user_id: str):
     """
     获取用户信息
     """
+    if user_id in _RESERVED_PATHS:
+        raise HTTPException(status_code=404, detail="Not found")
     try:
         user = await parse_client.get_user(user_id)
         return UserResponse(
