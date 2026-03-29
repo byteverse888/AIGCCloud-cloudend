@@ -145,25 +145,31 @@ class WechatPay:
         # 生成签名
         params["sign"] = generate_sign(params, self.api_key)
         
-        # 发起请求
+        # 发起请求（3次重试，15秒超时）
         xml_data = dict_to_xml(params)
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    self.UNIFIED_ORDER_URL,
-                    content=xml_data,
-                    headers={"Content-Type": "application/xml"},
-                )
-                result = xml_to_dict(response.text)
-        except httpx.ConnectTimeout:
-            logger.error(f"[微信支付] 连接超时，无法访问微信支付API")
-            return {"success": False, "error": "支付服务连接超时，请稍后重试"}
-        except httpx.TimeoutException:
-            logger.error(f"[微信支付] 请求超时")
-            return {"success": False, "error": "支付请求超时，请稍后重试"}
-        except Exception as e:
-            logger.error(f"[微信支付] 请求异常: {e}")
-            return {"success": False, "error": f"支付服务异常: {str(e)}"}
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    response = await client.post(
+                        self.UNIFIED_ORDER_URL,
+                        content=xml_data,
+                        headers={"Content-Type": "application/xml"},
+                    )
+                    result = xml_to_dict(response.text)
+                    break  # 请求成功，跳出重试
+            except httpx.TimeoutException as e:
+                last_error = e
+                logger.warning(f"[微信支付] 创建订单第{attempt}次超时: {out_trade_no}")
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[微信支付] 创建订单第{attempt}次异常: {e}")
+        else:
+            # 3次全部失败
+            logger.error(f"[微信支付] 创建订单3次重试均失败: {out_trade_no}")
+            if isinstance(last_error, httpx.TimeoutException):
+                return {"success": False, "error": "支付服务连接超时，请稍后重试"}
+            return {"success": False, "error": f"支付服务异常: {str(last_error)}"}
         
         if result.get("return_code") == "SUCCESS" and result.get("result_code") == "SUCCESS":
             return {
@@ -208,20 +214,28 @@ class WechatPay:
         params["sign"] = generate_sign(params, self.api_key)
         
         xml_data = dict_to_xml(params)
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    self.ORDER_QUERY_URL,
-                    content=xml_data,
-                    headers={"Content-Type": "application/xml"},
-                )
-                result = xml_to_dict(response.text)
-        except httpx.TimeoutException:
-            logger.error(f"[微信支付] 查询订单超时: {out_trade_no}")
-            return {"success": False, "error": "查询超时"}
-        except Exception as e:
-            logger.error(f"[微信支付] 查询订单异常: {e}")
-            return {"success": False, "error": str(e)}
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    response = await client.post(
+                        self.ORDER_QUERY_URL,
+                        content=xml_data,
+                        headers={"Content-Type": "application/xml"},
+                    )
+                    result = xml_to_dict(response.text)
+                    break
+            except httpx.TimeoutException as e:
+                last_error = e
+                logger.warning(f"[微信支付] 查询订单第{attempt}次超时: {out_trade_no}")
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[微信支付] 查询订单第{attempt}次异常: {e}")
+        else:
+            logger.error(f"[微信支付] 查询订单3次重试均失败: {out_trade_no}")
+            if isinstance(last_error, httpx.TimeoutException):
+                return {"success": False, "error": "查询超时，请稍后重试"}
+            return {"success": False, "error": str(last_error)}
         
         if result.get("return_code") == "SUCCESS":
             return {

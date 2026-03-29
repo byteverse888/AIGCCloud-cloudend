@@ -940,9 +940,11 @@ async def web3_register(request: Web3LoginRequest):
     
     # 生成 JWT（包含 session_token）
     jwt_token = create_access_token(data={
+        "sub": user_id,
         "user_id": user_id,
         "address": address,
         "session_token": session_token,
+        "parse_session": session_token,
     })
     
     # 构建响应
