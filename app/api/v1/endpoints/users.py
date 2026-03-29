@@ -69,6 +69,12 @@ class ImportWalletRequest(BaseModel):
     encrypted_keystore: str  # 加密后的 keystore JSON 字符串
 
 
+class ChangePasswordRequest(BaseModel):
+    """修改密码请求"""
+    current_password: str
+    new_password: str
+
+
 class TransferRequest(BaseModel):
     """转账请求"""
     to_address: str
@@ -343,6 +349,74 @@ async def reset_password(request: SetNewPasswordRequest):
     await redis_client.delete(f"reset_pwd:{request.token}")
     
     return {"success": True, "message": "密码重置成功"}
+
+
+@router.post("/change-password")
+async def change_password(
+    request: ChangePasswordRequest,
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    修改登录密码
+    1. 通过 Parse Server 验证当前密码
+    2. 使用 Master Key 更新为新密码
+    """
+    from app.core.logger import logger
+    import httpx
+
+    logger.info(f"[User] 用户 {user_id} 请求修改密码")
+
+    # 验证新密码长度
+    if len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少6位")
+
+    # 1. 获取用户信息，拿到 username
+    try:
+        user = await parse_client.get_user(user_id)
+        username = user.get("username")
+        if not username:
+            raise HTTPException(status_code=400, detail="用户信息异常")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[User] 获取用户信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取用户信息失败")
+
+    # 2. 通过 Parse Server 登录验证当前密码
+    from app.core.config import settings
+    login_url = f"{settings.parse_server_url}/login"
+    login_headers = {
+        "X-Parse-Application-Id": settings.parse_app_id,
+        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
+        "X-Parse-Revocable-Session": "1",
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                login_url,
+                params={"username": username, "password": request.current_password},
+                headers=login_headers,
+                timeout=30.0
+            )
+
+        if response.status_code != 200:
+            logger.warning(f"[User] 修改密码 - 当前密码验证失败: {user_id}")
+            raise HTTPException(status_code=400, detail="当前密码错误")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[User] 验证当前密码异常: {str(e)}")
+        raise HTTPException(status_code=500, detail="验证密码失败，请稍后重试")
+
+    # 3. 使用 Master Key 更新密码
+    try:
+        await parse_client.update_user_with_master_key(user_id, {"password": request.new_password})
+        logger.info(f"[User] 密码修改成功: {user_id}")
+        return {"success": True, "message": "密码修改成功"}
+    except Exception as e:
+        logger.error(f"[User] 更新密码失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="密码更新失败，请稍后重试")
 
 
 @router.post("/bind-web3")
