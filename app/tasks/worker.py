@@ -11,6 +11,7 @@ from app.tasks.arq_tasks import (
     process_paid_tx_orders,
     execute_ai_task,
     check_timeout_tasks,
+    settle_pending_incentives,
 )
 
 
@@ -24,6 +25,7 @@ class WorkerSettings:
         process_paid_tx_orders,
         execute_ai_task,
         check_timeout_tasks,
+        settle_pending_incentives,
     ]
     
     # 定时任务
@@ -34,6 +36,8 @@ class WorkerSettings:
         cron(process_paid_tx_orders, minute={2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57}),
         # 每10分钟检查超时任务
         cron(check_timeout_tasks, minute={0, 10, 20, 30, 40, 50}),
+        # 每天24小时清算待结算激励积分（凌晨2点执行）
+        cron(settle_pending_incentives, hour={2}, minute={0}),
     ]
     
     # Redis 配置

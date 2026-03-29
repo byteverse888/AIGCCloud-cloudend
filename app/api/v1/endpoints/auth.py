@@ -919,6 +919,14 @@ async def web3_register(request: Web3LoginRequest):
         
         logger.info(f"[Web3] 注册成功: {address[:10]}... (ID: {user_id})")
         
+        # 发放注册激励奖励
+        try:
+            from app.core.incentive_service import incentive_service
+            await incentive_service.grant_register_reward(user_id)
+            logger.info(f"[Web3] 注册激励发放成功: {user_id}")
+        except Exception as e:
+            logger.error(f"[Web3] 注册激励发放失败: {e}")
+        
     except httpx.HTTPStatusError as e:
         error_data = e.response.json() if e.response.headers.get("content-type", "").startswith("application/json") else {}
         if error_data.get("code") == 202:  # 用户已存在

@@ -4,7 +4,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
-from enum import Enum
 from datetime import datetime
 
 from app.core.parse_client import parse_client
@@ -18,10 +17,6 @@ router = APIRouter()
 
 # ============ 模型 ============
 
-class ClaimDailyRequest(BaseModel):
-    pass  # 无需额外参数
-
-
 class GrantIncentiveRequest(BaseModel):
     user_id: str
     type: str  # IncentiveType 字符串
@@ -29,66 +24,7 @@ class GrantIncentiveRequest(BaseModel):
     description: str
 
 
-class IncentiveRecord(BaseModel):
-    id: str
-    type: str
-    amount: float
-    description: str
-    created_at: datetime
-
-
 # ============ 端点 ============
-
-@router.post("/daily")
-async def claim_daily_reward(user_id: str = Depends(get_current_user_id)):
-    """
-    领取每日登录奖励
-    """
-    # 1. 检查今日是否已领取
-    already_claimed = await redis_client.check_daily_claim(user_id)
-    if already_claimed:
-        raise HTTPException(status_code=400, detail="今日奖励已领取")
-    
-    # 2. 通过激励服务发放奖励
-    result = await incentive_service.grant_daily_login(user_id)
-    
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "发放奖励失败"))
-    
-    # 3. 设置Redis领取标记
-    await redis_client.set_daily_claim_flag(user_id)
-    
-    return {
-        "success": True,
-        "amount": result.get("amount"),
-        "tx_hash": result.get("tx_hash"),
-        "message": result.get("message", f"领取成功，获得 {result.get('amount')} 金币"),
-    }
-
-
-@router.get("/daily/status")
-async def check_daily_status(user_id: str = Depends(get_current_user_id)):
-    """
-    检查今日领取状态
-    """
-    claimed = await redis_client.check_daily_claim(user_id)
-    
-    # 获取用户信息
-    try:
-        user = await parse_client.get_user(user_id)
-        member_level = user.get("memberLevel", "normal")
-        is_vip = member_level in ("vip", "svip")
-    except Exception:
-        is_vip = False
-    
-    amount = INCENTIVE_CONFIG["daily_login_paid"] if is_vip else INCENTIVE_CONFIG["daily_login_normal"]
-    
-    return {
-        "claimed": claimed,
-        "amount": amount,
-        "member_level": member_level if 'member_level' in dir() else "normal",
-    }
-
 
 @router.get("/history")
 async def get_incentive_history(
@@ -99,6 +35,7 @@ async def get_incentive_history(
 ):
     """
     获取用户激励历史
+    返回精简字段：type、amount、description、status、settlementStatus、created_at
     """
     where = {"userId": user_id}
     if type:
@@ -119,10 +56,12 @@ async def get_incentive_history(
     for item in result.get("results", []):
         records.append({
             "id": item["objectId"],
-            "type": item["type"],
-            "amount": item["amount"],
+            "type": item.get("type", ""),
+            "amount": item.get("amount", 0),
             "description": item.get("description", ""),
-            "created_at": item["createdAt"],
+            "status": item.get("status", ""),
+            "settlementStatus": item.get("settlementStatus", "pending"),
+            "created_at": item.get("createdAt", ""),
         })
     
     return {
@@ -136,18 +75,24 @@ async def get_incentive_history(
 @router.get("/balance")
 async def get_balance(user_id: str = Depends(get_current_user_id)):
     """
-    获取用户金币余额（从联盟链查询）
+    获取用户金币余额
+    返回：链上余额 + 待结算积分
     """
     try:
         user = await parse_client.get_user(user_id)
         web3_address = user.get("web3Address")
         
+        # 链上余额
         coins = 0
         if web3_address:
             coins = await web3_client.get_balance(web3_address)
         
+        # 待结算积分（从用户表读取）
+        pending_coins = user.get("pendingCoins", 0)
+        
         return {
             "coins": coins,
+            "pending_coins": pending_coins,
             "web3_address": web3_address,
             "member_level": user.get("memberLevel", "normal"),
         }
@@ -165,13 +110,16 @@ async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
     except Exception:
         raise HTTPException(status_code=404, detail="用户不存在")
     
-    # 从联盟链获取当前余额
+    # 链上余额
     web3_address = user.get("web3Address")
     coins = 0
     if web3_address:
         coins = await web3_client.get_balance(web3_address)
     
-    # 统计各类型奖励（从日志表）
+    # 待结算积分
+    pending_coins = user.get("pendingCoins", 0)
+    
+    # 统计各类型奖励
     stats = {}
     for itype in IncentiveType:
         count = await parse_client.count_objects("IncentiveLog", {
@@ -180,7 +128,7 @@ async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
         })
         stats[itype.value] = count
     
-    # 计算总获得金币（从日志表）
+    # 计算总获得金币
     result = await parse_client.query_objects(
         "IncentiveLog",
         where={"userId": user_id, "amount": {"$gt": 0}},
@@ -190,6 +138,7 @@ async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
     
     return {
         "coins": coins,
+        "pending_coins": pending_coins,
         "web3_address": web3_address,
         "total_earned": total_earned,
         "by_type": stats,
@@ -201,7 +150,6 @@ async def grant_incentive(request: GrantIncentiveRequest):
     """
     发放激励(内部接口) - 通过Web3接口铸造金币到联盟链
     """
-    # 验证用户存在
     try:
         user = await parse_client.get_user(request.user_id)
     except Exception:
@@ -223,7 +171,9 @@ async def grant_incentive(request: GrantIncentiveRequest):
         "type": request.type,
         "amount": request.amount,
         "txHash": mint_result.get("tx_hash"),
-        "description": request.description
+        "description": request.description,
+        "status": "success",
+        "settlementStatus": "settled",
     })
     
     # 获取新余额
@@ -247,7 +197,6 @@ async def consume_coins(
     """
     消费金币 - 通过Web3接口销毁金币
     """
-    # 获取用户信息
     try:
         user = await parse_client.get_user(user_id)
     except Exception:
@@ -274,7 +223,9 @@ async def consume_coins(
         "type": "consume",
         "amount": -amount,
         "txHash": burn_result.get("tx_hash"),
-        "description": description
+        "description": description,
+        "status": "success",
+        "settlementStatus": "settled",
     })
     
     # 获取新余额

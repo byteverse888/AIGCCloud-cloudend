@@ -411,7 +411,10 @@ class ParseClient:
             "txHash": {"type": "String"},
             "description": {"type": "String"},
             "status": {"type": "String"},
-            "relatedId": {"type": "String"}
+            "relatedId": {"type": "String"},
+            "settlementStatus": {"type": "String"},
+            "settledAt": {"type": "String"},
+            "batchId": {"type": "String"}
         },
         # 云端模型市场
         "models": {

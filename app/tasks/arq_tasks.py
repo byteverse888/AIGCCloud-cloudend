@@ -70,14 +70,13 @@ async def process_paid_order(ctx, order_object_id: str):
         if order_type == "recharge":
             coins = order.get("coins", 0)
             if coins > 0:
-                from app.core.incentive_service import incentive_service, IncentiveType
-                await incentive_service.reward_user(
-                    user_id=user_id,
-                    reward_type=IncentiveType.RECHARGE,
-                    amount=coins,
-                    description=f"充值 {coins} 金币"
+                # 充值订单：更新订单状态为完成（充值奖励暂不实现）
+                await parse_client.update_object(
+                    "Order",
+                    order_object_id,
+                    {"status": "completed", "completedAt": datetime.now().isoformat()}
                 )
-                logger.info(f"[ARQ] 用户 {user_id} 充值 {coins} 金币成功")
+                logger.info(f"[ARQ] 用户 {user_id} 充值订单完成: {coins} 金币")
                 
         elif order_type == "subscription":
             from app.api.v1.endpoints.member import complete_member_order
@@ -257,3 +256,93 @@ async def check_timeout_tasks(ctx):
     except Exception as e:
         logger.error(f"[ARQ] 检查超时任务失败: {e}")
         return {"timeout_count": 0}  # 不抛出异常，避免影响其他任务
+
+
+# ============ 激励清算任务 ============
+
+async def settle_pending_incentives(ctx):
+    """
+    清算待结算激励积分
+    
+    每24小时执行一次：
+    1. 查询 pendingCoins >= 1000 的用户
+    2. 调用 web3_client.mint() 铸造金币上链
+    3. 更新 IncentiveLog 的 settlementStatus 为 settled
+    4. 重置用户的 pendingCoins 为 0
+    """
+    from app.core.web3_client import web3_client
+    from app.core.incentive_service import SETTLEMENT_THRESHOLD
+    import uuid
+    
+    logger.info("[ARQ] 开始清算待结算激励积分...")
+    
+    try:
+        # 1. 查询待结算积分 >= 阈值的用户
+        result = await parse_client.query_users(
+            where={"pendingCoins": {"$gte": SETTLEMENT_THRESHOLD}},
+            limit=100
+        )
+        users = result.get("results", [])
+        
+        if not users:
+            logger.info("[ARQ] 无需清算的用户")
+            return {"settled_count": 0}
+        
+        settled_count = 0
+        batch_id = f"batch_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        
+        for user in users:
+            user_id = user.get("objectId")
+            web3_address = user.get("web3Address")
+            pending_coins = user.get("pendingCoins", 0)
+            
+            if not web3_address or pending_coins < SETTLEMENT_THRESHOLD:
+                continue
+            
+            try:
+                # 2. 铸造金币上链
+                mint_result = await web3_client.mint(web3_address, int(pending_coins))
+                
+                if mint_result.get("success"):
+                    tx_hash = mint_result.get("tx_hash", "")
+                    settled_at = datetime.now().isoformat()
+                    
+                    # 3. 批量更新该用户所有 pending 的 IncentiveLog
+                    pending_logs = await parse_client.query_objects(
+                        "IncentiveLog",
+                        where={"userId": user_id, "settlementStatus": "pending"},
+                        limit=1000
+                    )
+                    
+                    for log in pending_logs.get("results", []):
+                        await parse_client.update_object(
+                            "IncentiveLog",
+                            log["objectId"],
+                            {
+                                "settlementStatus": "settled",
+                                "txHash": tx_hash,
+                                "settledAt": settled_at,
+                                "batchId": batch_id,
+                            }
+                        )
+                    
+                    # 4. 重置用户 pendingCoins
+                    await parse_client.update_user_with_master_key(user_id, {
+                        "pendingCoins": 0
+                    })
+                    
+                    settled_count += 1
+                    logger.info(f"[ARQ] 用户 {user_id} 清算成功: {pending_coins} 金币, tx={tx_hash}")
+                else:
+                    # 铸造失败，标记日志为 failed
+                    logger.error(f"[ARQ] 用户 {user_id} 清算失败: {mint_result.get('error')}")
+                    
+            except Exception as e:
+                logger.error(f"[ARQ] 用户 {user_id} 清算异常: {e}")
+        
+        logger.info(f"[ARQ] 清算完成: batch={batch_id}, 成功 {settled_count}/{len(users)} 个用户")
+        return {"settled_count": settled_count, "batch_id": batch_id}
+        
+    except Exception as e:
+        logger.error(f"[ARQ] 清算待结算激励失败: {e}")
+        return {"settled_count": 0}

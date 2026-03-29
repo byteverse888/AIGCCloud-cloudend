@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from app.core.logger import logger
 from app.core.parse_client import parse_client
 from app.core.wechat_pay import wechat_pay, MEMBER_PLANS
-from app.core.incentive_service import incentive_service, IncentiveType
+from app.core.incentive_service import incentive_service
 
 router = APIRouter()
 
@@ -526,20 +526,17 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
     # 5. 发放积分奖励
     bonus = plan.get("bonus", 0)
     if bonus > 0:
-        web3_address = user.get("web3Address")
-        if web3_address:
-            try:
-                await incentive_service.grant_incentive(
-                    user_id=user_id,
-                    web3_address=web3_address,
-                    incentive_type=IncentiveType.MEMBER_SUBSCRIBE,
-                    amount=float(bonus),
-                    description=f"会员订阅奖励 - {plan.get('name', plan_id)}",
-                    related_id=order_id,
-                )
-                logger.info(f"[会员订阅] 发放积分奖励: {user_id}, {bonus}积分")
-            except Exception as e:
-                logger.error(f"[会员订阅] 发放积分失败: {e}")
+        try:
+            await incentive_service.grant_member_subscribe_reward(
+                user_id=user_id,
+                plan_name=plan.get('name', plan_id),
+                member_level=new_level,
+                order_id=order_id,
+                bonus=bonus,
+            )
+            logger.info(f"[会员订阅] 发放积分奖励: {user_id}, {bonus}积分")
+        except Exception as e:
+            logger.error(f"[会员订阅] 发放积分失败: {e}")
     
     return SubscribeResponse(
         success=True,
