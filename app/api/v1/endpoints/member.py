@@ -527,16 +527,19 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
     bonus = plan.get("bonus", 0)
     if bonus > 0:
         try:
-            await incentive_service.grant_member_subscribe_reward(
+            reward_result = await incentive_service.grant_member_subscribe_reward(
                 user_id=user_id,
                 plan_name=plan.get('name', plan_id),
                 member_level=new_level,
                 order_id=order_id,
                 bonus=bonus,
             )
-            logger.info(f"[会员订阅] 发放积分奖励: {user_id}, {bonus}积分")
+            if reward_result.get("success"):
+                logger.info(f"[会员订阅] 发放积分奖励成功: {user_id}, {bonus}积分")
+            else:
+                logger.warning(f"[会员订阅] 发放积分奖励失败: {user_id}, 原因: {reward_result.get('error')}")
         except Exception as e:
-            logger.error(f"[会员订阅] 发放积分失败: {e}")
+            logger.error(f"[会员订阅] 发放积分异常: {e}")
     
     return SubscribeResponse(
         success=True,

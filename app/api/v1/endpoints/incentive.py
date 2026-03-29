@@ -11,6 +11,7 @@ from app.core.redis_client import redis_client
 from app.core.web3_client import web3_client
 from app.core.deps import get_current_user_id
 from app.core.incentive_service import incentive_service, IncentiveType, INCENTIVE_CONFIG
+from app.core.logger import logger
 
 router = APIRouter()
 
@@ -25,6 +26,21 @@ class GrantIncentiveRequest(BaseModel):
 
 
 # ============ 端点 ============
+
+@router.post("/settle")
+async def trigger_settle():
+    """
+    手动触发清算待结算激励积分（管理接口）
+    直接执行清算逻辑，不经过ARQ队列
+    """
+    from app.tasks.arq_tasks import settle_pending_incentives
+    try:
+        result = await settle_pending_incentives({})
+        return {"success": True, "result": result}
+    except Exception as e:
+        logger.error(f"[手动清算] 失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/history")
 async def get_incentive_history(
