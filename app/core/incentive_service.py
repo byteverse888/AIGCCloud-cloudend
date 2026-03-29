@@ -78,7 +78,7 @@ class IncentiveService:
         logger.info(f"[激励服务] 发放激励: user={user_id}, amount={amount}, type={incentive_type.value}")
         
         try:
-            # 1. 创建 IncentiveLog 记录
+            # 创建 IncentiveLog 记录（待结算状态）
             log_data = {
                 "userId": user_id,
                 "web3Address": web3_address,
@@ -92,11 +92,6 @@ class IncentiveService:
                 log_data["relatedId"] = related_id
             
             await parse_client.create_object("IncentiveLog", log_data)
-            
-            # 2. 原子递增用户的 pendingCoins
-            await parse_client.update_user_with_master_key(user_id, {
-                "pendingCoins": {"__op": "Increment", "amount": int(amount)}
-            })
             
             logger.info(f"[激励服务] 激励发放成功: user={user_id}, +{amount} 金币 (待结算)")
             return {

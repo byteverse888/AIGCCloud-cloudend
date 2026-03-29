@@ -87,8 +87,13 @@ async def get_balance(user_id: str = Depends(get_current_user_id)):
         if web3_address:
             coins = await web3_client.get_balance(web3_address)
         
-        # 待结算积分（从用户表读取）
-        pending_coins = user.get("pendingCoins", 0)
+        # 待结算积分（从 IncentiveLog 实时计算，避免计数器不一致）
+        pending_result = await parse_client.query_objects(
+            "IncentiveLog",
+            where={"userId": user_id, "settlementStatus": "pending"},
+            limit=1000
+        )
+        pending_coins = sum(item.get("amount", 0) for item in pending_result.get("results", []))
         
         return {
             "coins": coins,
@@ -116,8 +121,13 @@ async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
     if web3_address:
         coins = await web3_client.get_balance(web3_address)
     
-    # 待结算积分
-    pending_coins = user.get("pendingCoins", 0)
+    # 待结算积分（从 IncentiveLog 实时计算）
+    pending_result = await parse_client.query_objects(
+        "IncentiveLog",
+        where={"userId": user_id, "settlementStatus": "pending"},
+        limit=1000
+    )
+    pending_coins = sum(item.get("amount", 0) for item in pending_result.get("results", []))
     
     # 统计各类型奖励
     stats = {}

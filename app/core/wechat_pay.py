@@ -16,21 +16,24 @@ from app.core.logger import logger
 # 会员套餐配置
 # VIP定价: 1月9.9元, 半年9折, 一年85折, 3年8折, 5年75折
 # SVIP: VIP价格的2倍
+# bonus 公式: round(price × 基础费率10 × 时长加成)
+# 时长加成: 体验=1.0, 月=1.0, 半年=1.1, 年=1.2, 三年=1.3, 五年=1.35
+# 确保SVIP同档位bonus > VIP（因为价格高），时长越长金币/元比率越高
 MEMBER_PLANS = {
     # VIP 套餐
-    "vip_day": {"level": "vip", "days": 1, "price": 0.20, "original_price": 0.20, "discount": 100, "bonus": 5, "name": "VIP体验1天"},
-    "vip_month": {"level": "vip", "days": 30, "price": 9.90, "original_price": 9.90, "discount": 100, "bonus": 50, "name": "VIP月度会员"},
-    "vip_half": {"level": "vip", "days": 180, "price": 53.50, "original_price": 59.40, "discount": 90, "bonus": 300, "name": "VIP半年会员"},
-    "vip_year": {"level": "vip", "days": 365, "price": 101.00, "original_price": 118.80, "discount": 85, "bonus": 800, "name": "VIP年度会员"},
-    "vip_3year": {"level": "vip", "days": 1095, "price": 285.00, "original_price": 356.40, "discount": 80, "bonus": 3000, "name": "VIP三年会员"},
-    "vip_5year": {"level": "vip", "days": 1825, "price": 445.50, "original_price": 594.00, "discount": 75, "bonus": 6000, "name": "VIP五年会员"},
+    "vip_day": {"level": "vip", "days": 1, "price": 0.20, "original_price": 0.20, "discount": 100, "bonus": 2, "name": "VIP体验1天"},
+    "vip_month": {"level": "vip", "days": 30, "price": 9.90, "original_price": 9.90, "discount": 100, "bonus": 99, "name": "VIP月度会员"},
+    "vip_half": {"level": "vip", "days": 180, "price": 53.50, "original_price": 59.40, "discount": 90, "bonus": 589, "name": "VIP半年会员"},
+    "vip_year": {"level": "vip", "days": 365, "price": 101.00, "original_price": 118.80, "discount": 85, "bonus": 1212, "name": "VIP年度会员"},
+    "vip_3year": {"level": "vip", "days": 1095, "price": 285.00, "original_price": 356.40, "discount": 80, "bonus": 3705, "name": "VIP三年会员"},
+    "vip_5year": {"level": "vip", "days": 1825, "price": 445.50, "original_price": 594.00, "discount": 75, "bonus": 6014, "name": "VIP五年会员"},
     # SVIP 套餐 (VIP价格的2倍)
-    "svip_day": {"level": "svip", "days": 1, "price": 0.30, "original_price": 0.30, "discount": 100, "bonus": 10, "name": "SVIP体验1天"},
-    "svip_month": {"level": "svip", "days": 30, "price": 19.80, "original_price": 19.80, "discount": 100, "bonus": 100, "name": "SVIP月度会员"},
-    "svip_half": {"level": "svip", "days": 180, "price": 107.00, "original_price": 118.80, "discount": 90, "bonus": 600, "name": "SVIP半年会员"},
-    "svip_year": {"level": "svip", "days": 365, "price": 202.00, "original_price": 237.60, "discount": 85, "bonus": 1600, "name": "SVIP年度会员"},
-    "svip_3year": {"level": "svip", "days": 1095, "price": 570.00, "original_price": 712.80, "discount": 80, "bonus": 6000, "name": "SVIP三年会员"},
-    "svip_5year": {"level": "svip", "days": 1825, "price": 891.00, "original_price": 1188.00, "discount": 75, "bonus": 12000, "name": "SVIP五年会员"},
+    "svip_day": {"level": "svip", "days": 1, "price": 0.30, "original_price": 0.30, "discount": 100, "bonus": 3, "name": "SVIP体验1天"},
+    "svip_month": {"level": "svip", "days": 30, "price": 19.80, "original_price": 19.80, "discount": 100, "bonus": 198, "name": "SVIP月度会员"},
+    "svip_half": {"level": "svip", "days": 180, "price": 107.00, "original_price": 118.80, "discount": 90, "bonus": 1177, "name": "SVIP半年会员"},
+    "svip_year": {"level": "svip", "days": 365, "price": 202.00, "original_price": 237.60, "discount": 85, "bonus": 2424, "name": "SVIP年度会员"},
+    "svip_3year": {"level": "svip", "days": 1095, "price": 570.00, "original_price": 712.80, "discount": 80, "bonus": 7410, "name": "SVIP三年会员"},
+    "svip_5year": {"level": "svip", "days": 1825, "price": 891.00, "original_price": 1188.00, "discount": 75, "bonus": 12029, "name": "SVIP五年会员"},
 }
 
 

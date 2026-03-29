@@ -265,10 +265,9 @@ async def settle_pending_incentives(ctx):
     清算待结算激励积分
     
     每24小时执行一次：
-    1. 查询 pendingCoins >= 1000 的用户
+    1. 从 IncentiveLog 聚合查询待结算金额 >= 阈值的用户
     2. 调用 web3_client.mint() 铸造金币上链
     3. 更新 IncentiveLog 的 settlementStatus 为 settled
-    4. 重置用户的 pendingCoins 为 0
     """
     from app.core.web3_client import web3_client
     from app.core.incentive_service import SETTLEMENT_THRESHOLD
@@ -277,24 +276,37 @@ async def settle_pending_incentives(ctx):
     logger.info("[ARQ] 开始清算待结算激励积分...")
     
     try:
-        # 1. 查询待结算积分 >= 阈值的用户
-        result = await parse_client.query_users(
-            where={"pendingCoins": {"$gte": SETTLEMENT_THRESHOLD}},
-            limit=100
+        # 1. 查询所有待结算的 IncentiveLog，按用户聚合
+        pending_logs = await parse_client.query_objects(
+            "IncentiveLog",
+            where={"settlementStatus": "pending"},
+            limit=1000
         )
-        users = result.get("results", [])
+        all_pending = pending_logs.get("results", [])
         
-        if not users:
-            logger.info("[ARQ] 无需清算的用户")
+        if not all_pending:
+            logger.info("[ARQ] 无待清算的记录")
             return {"settled_count": 0}
+        
+        # 按用户聚合待结算金额
+        user_pending = {}  # {user_id: {"amount": total, "web3_address": addr, "logs": [...]}}
+        for log in all_pending:
+            uid = log.get("userId")
+            if uid not in user_pending:
+                user_pending[uid] = {
+                    "amount": 0,
+                    "web3_address": log.get("web3Address"),
+                    "logs": []
+                }
+            user_pending[uid]["amount"] += log.get("amount", 0)
+            user_pending[uid]["logs"].append(log)
         
         settled_count = 0
         batch_id = f"batch_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
         
-        for user in users:
-            user_id = user.get("objectId")
-            web3_address = user.get("web3Address")
-            pending_coins = user.get("pendingCoins", 0)
+        for user_id, info in user_pending.items():
+            pending_coins = info["amount"]
+            web3_address = info["web3_address"]
             
             if not web3_address or pending_coins < SETTLEMENT_THRESHOLD:
                 continue
@@ -307,14 +319,8 @@ async def settle_pending_incentives(ctx):
                     tx_hash = mint_result.get("tx_hash", "")
                     settled_at = datetime.now().isoformat()
                     
-                    # 3. 批量更新该用户所有 pending 的 IncentiveLog
-                    pending_logs = await parse_client.query_objects(
-                        "IncentiveLog",
-                        where={"userId": user_id, "settlementStatus": "pending"},
-                        limit=1000
-                    )
-                    
-                    for log in pending_logs.get("results", []):
+                    # 3. 更新该用户所有 pending 的 IncentiveLog
+                    for log in info["logs"]:
                         await parse_client.update_object(
                             "IncentiveLog",
                             log["objectId"],
@@ -326,21 +332,15 @@ async def settle_pending_incentives(ctx):
                             }
                         )
                     
-                    # 4. 重置用户 pendingCoins
-                    await parse_client.update_user_with_master_key(user_id, {
-                        "pendingCoins": 0
-                    })
-                    
                     settled_count += 1
                     logger.info(f"[ARQ] 用户 {user_id} 清算成功: {pending_coins} 金币, tx={tx_hash}")
                 else:
-                    # 铸造失败，标记日志为 failed
                     logger.error(f"[ARQ] 用户 {user_id} 清算失败: {mint_result.get('error')}")
                     
             except Exception as e:
                 logger.error(f"[ARQ] 用户 {user_id} 清算异常: {e}")
         
-        logger.info(f"[ARQ] 清算完成: batch={batch_id}, 成功 {settled_count}/{len(users)} 个用户")
+        logger.info(f"[ARQ] 清算完成: batch={batch_id}, 成功 {settled_count}/{len(user_pending)} 个用户")
         return {"settled_count": settled_count, "batch_id": batch_id}
         
     except Exception as e:
