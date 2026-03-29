@@ -398,11 +398,12 @@ async def get_order_status(
 
 async def complete_member_order(order_id: str, order: dict, session_token: Optional[str] = None) -> SubscribeResponse:
     """
-    完成会员订单
+    完成会员订单（幂等）
     
-    1. 更新订单状态
-    2. 更新用户会员等级和到期时间
-    3. 发放积分奖励
+    1. 检查订单是否已处理（防止重复发放）
+    2. 更新订单状态
+    3. 更新用户会员等级和到期时间
+    4. 发放积分奖励
     
     Args:
         order_id: 订单ID
@@ -415,7 +416,19 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
     
     logger.info(f"[会员订单] 开始处理: order_id={order_id}, user_id={user_id}, plan_id={plan_id}, has_session={bool(session_token)}")
     
-    # 1. 更新订单状态
+    # 0. 幂等性检查：重新查询订单状态，防止并发重复处理
+    try:
+        fresh_result = await parse_client.query_objects(
+            "MemberOrder",
+            where={"orderId": order_id},
+            limit=1,
+        )
+        fresh_orders = fresh_result.get("results", [])
+        if fresh_orders and fresh_orders[0].get("status") == "paid":
+            logger.info(f"[会员订单] 订单已处理，跳过: {order_id}")
+            return SubscribeResponse(success=True, order_id=order_id, message="订单已处理")
+    except Exception as e:
+        logger.warning(f"[会员订单] 幂等性检查失败，继续处理: {e}")
     try:
         await parse_client.query_and_update(
             "MemberOrder",
@@ -515,8 +528,8 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
             await parse_client.update_user_with_session(user_id, update_data, session_token)
             logger.info(f"[会员订单] 使用session更新用户成功")
         else:
-            await parse_client.update_user(user_id, update_data)
-            logger.info(f"[会员订单] 直接更新用户成功")
+            await parse_client.update_user_with_master_key(user_id, update_data)
+            logger.info(f"[会员订单] 使用MasterKey更新用户成功")
     except Exception as e:
         logger.error(f"[会员订单] 更新用户会员状态失败: {e}")
         return SubscribeResponse(success=False, message="更新会员状态失败")
