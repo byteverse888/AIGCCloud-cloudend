@@ -147,13 +147,23 @@ class WechatPay:
         
         # 发起请求
         xml_data = dict_to_xml(params)
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                self.UNIFIED_ORDER_URL,
-                content=xml_data,
-                headers={"Content-Type": "application/xml"},
-            )
-            result = xml_to_dict(response.text)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    self.UNIFIED_ORDER_URL,
+                    content=xml_data,
+                    headers={"Content-Type": "application/xml"},
+                )
+                result = xml_to_dict(response.text)
+        except httpx.ConnectTimeout:
+            logger.error(f"[微信支付] 连接超时，无法访问微信支付API")
+            return {"success": False, "error": "支付服务连接超时，请稍后重试"}
+        except httpx.TimeoutException:
+            logger.error(f"[微信支付] 请求超时")
+            return {"success": False, "error": "支付请求超时，请稍后重试"}
+        except Exception as e:
+            logger.error(f"[微信支付] 请求异常: {e}")
+            return {"success": False, "error": f"支付服务异常: {str(e)}"}
         
         if result.get("return_code") == "SUCCESS" and result.get("result_code") == "SUCCESS":
             return {
@@ -198,13 +208,20 @@ class WechatPay:
         params["sign"] = generate_sign(params, self.api_key)
         
         xml_data = dict_to_xml(params)
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                self.ORDER_QUERY_URL,
-                content=xml_data,
-                headers={"Content-Type": "application/xml"},
-            )
-            result = xml_to_dict(response.text)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    self.ORDER_QUERY_URL,
+                    content=xml_data,
+                    headers={"Content-Type": "application/xml"},
+                )
+                result = xml_to_dict(response.text)
+        except httpx.TimeoutException:
+            logger.error(f"[微信支付] 查询订单超时: {out_trade_no}")
+            return {"success": False, "error": "查询超时"}
+        except Exception as e:
+            logger.error(f"[微信支付] 查询订单异常: {e}")
+            return {"success": False, "error": str(e)}
         
         if result.get("return_code") == "SUCCESS":
             return {
