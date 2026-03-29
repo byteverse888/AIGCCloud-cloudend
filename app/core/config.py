@@ -57,9 +57,6 @@ class Settings(BaseSettings):
     web3_chain_id: int = 1
     web3_contract_address: str = ""
     web3_private_key: str = ""
-    
-    # 运营激励账户（用于发放激励）
-    incentive_wallet_private_key: str = ""  # 激励钱包私钥
 
     # Email
     smtp_host: str = ""

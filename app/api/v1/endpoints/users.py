@@ -427,6 +427,8 @@ async def bind_web3_address(
     """
     绑定Web3地址到用户账号
     """
+    from app.core.logger import logger
+    
     # 验证地址格式
     if not is_valid_ethereum_address(request.web3_address):
         raise HTTPException(status_code=400, detail="无效的以太坊地址")
@@ -434,13 +436,29 @@ async def bind_web3_address(
     # 转换为校验和格式
     address = checksum_address(request.web3_address)
     
-    # 检查地址是否已被绑定
+    # 检查当前用户是否已绑定相同地址（幂等）
+    try:
+        user = await parse_client.get_user(user_id)
+        if user.get("web3Address") == address:
+            return {
+                "success": True,
+                "message": "Web3地址已绑定",
+                "address": address
+            }
+    except Exception:
+        pass
+    
+    # 检查地址是否已被其他账号绑定
     existing = await parse_client.query_users(where={"web3Address": address})
     if existing.get("results"):
-        raise HTTPException(status_code=400, detail="该地址已被其他账号绑定")
+        existing_user = existing["results"][0]
+        if existing_user.get("objectId") != user_id:
+            raise HTTPException(status_code=400, detail="该地址已被其他账号绑定")
     
-    # 更新用户
-    await parse_client.update_user(user_id, {"web3Address": address})
+    # 使用 Master Key 更新用户（确保权限）
+    await parse_client.update_user_with_master_key(user_id, {"web3Address": address})
+    
+    logger.info(f"[User] Web3地址绑定成功: {user_id} -> {address}")
     
     return {
         "success": True,
