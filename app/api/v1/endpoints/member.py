@@ -371,13 +371,7 @@ async def get_order_status(
         try:
             pay_result = await wechat_pay.query_order(order_id)
             if pay_result.get("trade_state") == "SUCCESS":
-                # 支付成功，更新订单并完成订阅
-                await parse_client.query_and_update(
-                    "MemberOrder",
-                    {"orderId": order_id},
-                    {"status": "paid", "paidAt": datetime.now().isoformat()},
-                )
-                # 完成会员订阅
+                # 支付成功，完成会员订阅（订单状态更新由 complete_member_order 统一处理）
                 await complete_member_order(order_id, order)
                 return {
                     "order_id": order_id,
