@@ -27,3 +27,7 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8882
 启动服务后访问：
 - Swagger UI: http://localhost:8882/docs
 - ReDoc: http://localhost:8882/redoc
+
+## 其他
+
+手动触发定时任务：POST http://cloudend地址/api/v1/incentive/settle
