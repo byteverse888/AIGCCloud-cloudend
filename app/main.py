@@ -2,8 +2,8 @@
 AIGC Cloud Platform API
 主入口文件
 """
+import os
 import signal
-import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -17,14 +17,7 @@ from app.api.v1 import router as api_v1_router
 
 # ARQ Worker 实例
 _arq_worker = None
-
-# Windows 下强制终止的信号处理
-def _force_exit(sig, frame):
-    logger.info(f"\n收到信号 {sig}，强制退出...")
-    sys.exit(0)
-
-# 注册 SIGINT (Ctrl+C)
-signal.signal(signal.SIGINT, _force_exit)
+_arq_task = None
 
 
 @asynccontextmanager
@@ -55,7 +48,7 @@ async def lifespan(app: FastAPI):
         logger.error(f"ARQ 连接失败: {e}")
     
     # 启动 ARQ Worker
-    global _arq_worker
+    global _arq_worker, _arq_task
     try:
         import asyncio
         from arq import Worker
@@ -67,9 +60,9 @@ async def lifespan(app: FastAPI):
             redis_settings=WorkerSettings.redis_settings,
             max_jobs=WorkerSettings.max_jobs,
             job_timeout=WorkerSettings.job_timeout,
-            handle_signals=False,  # 不让 ARQ 接管信号处理，避免和 uvicorn 冲突
+            handle_signals=False,
         )
-        asyncio.create_task(_arq_worker.async_run())
+        _arq_task = asyncio.create_task(_arq_worker.async_run())
         logger.info("ARQ Worker 已启动")
     except Exception as e:
         logger.error(f"ARQ Worker 启动失败: {e}")
@@ -79,8 +72,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down CloudendAPI...")
     
-    # 关闭 ARQ
+    # 先取消 ARQ 任务，再关闭 Worker
     try:
+        if _arq_task and not _arq_task.done():
+            _arq_task.cancel()
         if _arq_worker:
             await _arq_worker.close()
         await close_arq_pool()
