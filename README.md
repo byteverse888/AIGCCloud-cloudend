@@ -13,8 +13,19 @@ FastAPI后端服务，为AIGC云平台提供核心业务逻辑处理。
 ## 启动方式
 
 ```bash
+# Create virtual environment
+sudo apt install python3.12-venv -y
+
+# 创建虚拟环境
+python3 -m venv .venv
+# 激活虚拟环境
+# Linux/macOS
+source .venv/bin/activate
+
 # 安装依赖
 pip install -r requirements.txt
+
+# 修改.env文件
 
 # 启动服务
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8882

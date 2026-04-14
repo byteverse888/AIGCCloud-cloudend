@@ -9,6 +9,9 @@ from app.core.config import settings
 from app.core.logger import logger
 
 
+# ARQ 队列名称（与 worker.py 保持一致）
+ARQ_QUEUE_NAME = 'arq:cloudend'
+
 # ARQ Redis 连接池
 _arq_pool: Optional[ArqRedis] = None
 
@@ -49,6 +52,6 @@ async def enqueue_task(func_name: str, *args, **kwargs):
         **kwargs: 关键字参数
     """
     pool = await get_arq_pool()
-    job = await pool.enqueue_job(func_name, *args, **kwargs)
+    job = await pool.enqueue_job(func_name, *args, _queue_name=ARQ_QUEUE_NAME, **kwargs)
     logger.info(f"[ARQ] 任务入队: {func_name}, job_id: {job.job_id}")
     return job

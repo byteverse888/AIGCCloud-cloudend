@@ -48,6 +48,9 @@ class WorkerSettings:
         password=settings.redis_password or None,
     )
     
+    # 队列名称前缀（隔离不同服务的 ARQ 任务）
+    queue_name = 'arq:cloudend'
+    
     # Worker 配置
     max_jobs = 10
     job_timeout = 300  # 5分钟超时
