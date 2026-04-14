@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     debug: bool = True  # 开发模式
+    frontend_url: str = "http://localhost:3000"  # 前端地址，用于邮件激活链接等
 
     # PostgreSQL
     postgres_host: str = "localhost"

@@ -370,7 +370,7 @@ async def phone_login(request: PhoneLoginRequest):
 
 
 @router.post("/email/register")
-async def email_register(request: EmailRegisterRequest, req: Request):
+async def email_register(request: EmailRegisterRequest):
     """
     邮箱注册
     1. 检查邮箱是否已存在
@@ -397,10 +397,9 @@ async def email_register(request: EmailRegisterRequest, req: Request):
     }
     await redis_client.set_activation_token(token, user_data, ex=86400)
     
-    # 发送激活邮件
-    base_url = str(req.base_url).rstrip("/")
-    # 使用专门的 auth 激活链接
-    activation_link = f"{base_url}/api/v1/auth/email/activate?token={token}"
+    # 发送激活邮件 - 链接指向前端激活页面
+    frontend_url = settings.frontend_url.rstrip("/")
+    activation_link = f"{frontend_url}/activate?token={token}"
     
     subject = "【巴特星球】账号激活"
     body = f"""
@@ -503,17 +502,12 @@ async def email_activate(token: str):
         # 删除 Token
         await redis_client.delete_activation_token(token)
         
-        # 返回一个简单的 HTML 成功页面或重定向
-        from fastapi.responses import HTMLResponse
-        return HTMLResponse(content=f"""
-        <html>
-            <body style="text-align: center; padding-top: 50px; font-family: sans-serif;">
-                <h1 style="color: #52c41a;">激活成功！</h1>
-                <p>您的账号 {email} 已成功激活。</p>
-                <p>现在您可以返回应用进行登录了。</p>
-            </body>
-        </html>
-        """)
+        # 返回 JSON 响应（前端激活页面会调用此接口）
+        return {
+            "success": True,
+            "message": "邮箱激活成功",
+            "email": email
+        }
         
     except Exception as e:
         logger.error(f"[Auth] 激活异常: {str(e)}")
