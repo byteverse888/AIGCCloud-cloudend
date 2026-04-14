@@ -386,7 +386,7 @@ class ParseClient:
             "type": {"type": "String"},
             "model": {"type": "String"},
             "data": {"type": "Object"},
-            "status": {"type": "String"},
+            "status": {"type": "Number"},
             "cost": {"type": "Number"},
             "results": {"type": "Array"},
             "errorMessage": {"type": "String"},
@@ -471,6 +471,17 @@ class ParseClient:
         }
     }
     
+    # 默认 CLP：所有客户端可读写（开发阶段）
+    DEFAULT_CLP = {
+        "find": {"*": True},
+        "count": {"*": True},
+        "get": {"*": True},
+        "create": {"*": True},
+        "update": {"*": True},
+        "delete": {"*": True},
+        "addField": {},
+    }
+    
     async def ensure_schema(self):
         """确保所有业务类在 Parse Server 中存在并包含正确类型的字段（Schema API + Master Key）"""
         async with httpx.AsyncClient() as client:
@@ -523,14 +534,21 @@ class ParseClient:
                                 logger.error(f"[Parse] 字段补充失败: {class_name} - {add_resp.text}")
                         else:
                             logger.debug(f"[Parse] Schema OK: {class_name}")
+                        
+                        # 确保 CLP 正确（防止默认权限过严导致客户端无法访问）
+                        await self._ensure_clp(client, class_name)
                         continue
                     
-                    # 类不存在，创建并带上字段定义
+                    # 类不存在，创建并带上字段定义和 CLP
                     logger.info(f"[Parse] 创建 Schema: {class_name}")
                     create_resp = await client.post(
                         f"{self.base_url}/schemas/{class_name}",
                         headers=self.master_headers,
-                        json={"className": class_name, "fields": fields},
+                        json={
+                            "className": class_name,
+                            "fields": fields,
+                            "classLevelPermissions": self.DEFAULT_CLP,
+                        },
                         timeout=10.0,
                     )
                     if create_resp.status_code in (200, 201):
@@ -539,6 +557,22 @@ class ParseClient:
                         logger.error(f"[Parse] Schema 创建失败: {class_name} - {create_resp.text}")
                 except Exception as e:
                     logger.error(f"[Parse] ensure_schema 异常({class_name}): {e}")
+    
+    async def _ensure_clp(self, client, class_name: str):
+        """确保指定类的 CLP 允许客户端访问"""
+        try:
+            resp = await client.put(
+                f"{self.base_url}/schemas/{class_name}",
+                headers=self.master_headers,
+                json={"className": class_name, "classLevelPermissions": self.DEFAULT_CLP},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                logger.debug(f"[Parse] CLP 已更新: {class_name}")
+            else:
+                logger.warning(f"[Parse] CLP 更新失败: {class_name} - {resp.text}")
+        except Exception as e:
+            logger.warning(f"[Parse] CLP 更新异常({class_name}): {e}")
     
     # ============ 辅助方法 ============
     

@@ -1,7 +1,9 @@
-"""
+""" 
 AIGC Cloud Platform API
 主入口文件
 """
+import signal
+import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -15,6 +17,14 @@ from app.api.v1 import router as api_v1_router
 
 # ARQ Worker 实例
 _arq_worker = None
+
+# Windows 下强制终止的信号处理
+def _force_exit(sig, frame):
+    logger.info(f"\n收到信号 {sig}，强制退出...")
+    sys.exit(0)
+
+# 注册 SIGINT (Ctrl+C)
+signal.signal(signal.SIGINT, _force_exit)
 
 
 @asynccontextmanager
@@ -57,6 +67,7 @@ async def lifespan(app: FastAPI):
             redis_settings=WorkerSettings.redis_settings,
             max_jobs=WorkerSettings.max_jobs,
             job_timeout=WorkerSettings.job_timeout,
+            handle_signals=False,  # 不让 ARQ 接管信号处理，避免和 uvicorn 冲突
         )
         asyncio.create_task(_arq_worker.async_run())
         logger.info("ARQ Worker 已启动")
