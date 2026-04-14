@@ -479,7 +479,7 @@ class ParseClient:
         "create": {"*": True},
         "update": {"*": True},
         "delete": {"*": True},
-        "addField": {},
+        "addField": {"*": True},
     }
     
     async def ensure_schema(self):

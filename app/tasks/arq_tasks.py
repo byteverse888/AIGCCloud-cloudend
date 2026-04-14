@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from app.core.logger import logger
 from app.core.parse_client import parse_client
 from app.core.wechat_pay import wechat_pay
+from app.api.v1.endpoints.tasks import TaskStatus
 
 
 # ============ 支付相关任务 ============
@@ -165,7 +166,7 @@ async def execute_ai_task(ctx, task_id: str, task_type: str, params: dict):
             "AITask",
             task_id,
             {
-                "status": "processing",
+                "status": TaskStatus.PROCESSING,
                 "startedAt": {"__type": "Date", "iso": datetime.utcnow().isoformat() + "Z"}
             }
         )
@@ -180,7 +181,7 @@ async def execute_ai_task(ctx, task_id: str, task_type: str, params: dict):
             "AITask",
             task_id,
             {
-                "status": "completed",
+                "status": TaskStatus.COMPLETED,
                 "result": result,
                 "completedAt": {"__type": "Date", "iso": datetime.utcnow().isoformat() + "Z"}
             }
@@ -195,7 +196,7 @@ async def execute_ai_task(ctx, task_id: str, task_type: str, params: dict):
             "AITask",
             task_id,
             {
-                "status": "failed",
+                "status": TaskStatus.FAILED,
                 "error": str(e)
             }
         )
@@ -214,7 +215,7 @@ async def check_timeout_tasks(ctx):
         # 先查询 processing 状态的任务，不带日期过滤
         result = await parse_client.query_objects(
             "AITask",
-            where={"status": "processing"},
+            where={"status": TaskStatus.PROCESSING},
             limit=100
         )
         tasks = result.get("results", [])
@@ -242,7 +243,7 @@ async def check_timeout_tasks(ctx):
                         "AITask",
                         task["objectId"],
                         {
-                            "status": "timeout",
+                            "status": TaskStatus.FAILED,
                             "error": "任务处理超时"
                         }
                     )
