@@ -28,16 +28,16 @@ pip install -r requirements.txt
 # 修改.env文件
 
 # 启动服务
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8882
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 或
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8882
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 ```
 
 ## API文档
 
 启动服务后访问：
-- Swagger UI: http://localhost:8882/docs
-- ReDoc: http://localhost:8882/redoc
+- Swagger UI: http://localhost:8001/docs
+- ReDoc: http://localhost:8001/redoc
 
 ## 其他
 
