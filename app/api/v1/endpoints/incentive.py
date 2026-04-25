@@ -47,15 +47,22 @@ async def get_incentive_history(
     page: int = 1,
     limit: int = 20,
     type: Optional[str] = None,
+    exclude_type: Optional[str] = None,
+    settlement_status: Optional[str] = None,
     user_id: str = Depends(get_current_user_id)
 ):
     """
     获取用户激励历史
     返回精简字段：type、amount、description、status、settlementStatus、created_at
+    可选过滤: settlement_status (pending/settled), exclude_type (排除指定类型如settlement)
     """
     where = {"userId": user_id}
     if type:
         where["type"] = type
+    if exclude_type:
+        where["type"] = {"$nin": exclude_type.split(",")}
+    if settlement_status:
+        where["settlementStatus"] = settlement_status
     
     skip = (page - 1) * limit
     result = await parse_client.query_objects(

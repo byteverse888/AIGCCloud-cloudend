@@ -1,0 +1,6 @@
+# 激励结算模块独立依赖
+# 安装: pip install -r incentive/requirements.txt
+httpx>=0.24.0
+eth-account>=0.10.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
