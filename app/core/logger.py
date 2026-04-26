@@ -18,6 +18,9 @@ def setup_logging():
     
     log_file = os.path.join(log_dir, settings.log_file)
     
+    # 解析日志级别
+    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    
     # 日志格式
     file_format = logging.Formatter(
         '%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d | %(message)s',
@@ -35,23 +38,23 @@ def setup_logging():
         backupCount=5,               # 保留5个文件
         encoding='utf-8'
     )
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(log_level)
     file_handler.setFormatter(file_format)
     
     # 终端 Handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(log_level)
     console_handler.setFormatter(console_format)
     
     # 根 Logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(log_level)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
     
     # 应用 Logger
     app_logger = logging.getLogger('aigccloud')
-    app_logger.setLevel(logging.DEBUG)
+    app_logger.setLevel(log_level)
     
     # 降低第三方库日志级别
     logging.getLogger('httpx').setLevel(logging.WARNING)

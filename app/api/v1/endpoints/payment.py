@@ -15,6 +15,7 @@ from app.core.security import generate_order_no
 from app.core.deps import get_current_user_id, get_optional_parse_user
 from app.core.config import settings
 from app.core.incentive_service import incentive_service
+from eth_account import Account
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -155,7 +156,7 @@ async def create_order(
         "description": description,
         # Web3支付信息
         "web3_payment": {
-            "to_address": settings.web3_operator_address,  # 运营账户地址
+            "to_address": Account.from_key(settings.web3_private_key).address if settings.web3_private_key else "",  # 从私钥派生运营账户地址
             "amount_eth": amount,  # 转账金额（ETH）
         }
     }

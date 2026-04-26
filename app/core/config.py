@@ -31,9 +31,7 @@ class Settings(BaseSettings):
 
     # JWT
     jwt_secret_key: str = "your-secret-key-256bits-random-string"  # 256位随机字符串
-    jwt_secret_key: str = "your-secret-key-256bits-random-string"  # 256位随机字符串
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 1440  # 24小时
     jwt_access_token_expire_minutes: int = 1440  # 24小时
 
     # WeChat Pay (测试数据)
@@ -47,11 +45,6 @@ class Settings(BaseSettings):
     wechat_api_v3_key: str = ""  # API v3 密钥 (32字节)
     wechat_serial_no: str = ""   # 商户API证书序列号
     wechat_private_key_path: str = ""  # 商户私钥文件路径 (apiclient_key.pem)
-
-    # Web3 运营账户（用于发放金币激励）
-    web3_operator_private_key: str = "0x0000000000000000000000000000000000000000000000000000000000000001"
-    web3_operator_address: str = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
-    web3_coin_contract: str = ""  # 金币合约地址
 
     # Web3 联盟链
     web3_rpc_url: str = ""
@@ -67,6 +60,7 @@ class Settings(BaseSettings):
     smtp_from_name: str = "巴特星球"
 
     # Log
+    log_level: str = "INFO"  # 日志级别：DEBUG/INFO/WARNING/ERROR
     log_dir: str = "./logs"
     log_file: str = "aigccloud.log"
 
@@ -74,21 +68,6 @@ class Settings(BaseSettings):
     default_admin_username: str = "admin"
     default_admin_email: str = "admin@example.com"
     default_admin_password: str = "admin123456"
-
-    # 对象存储 - 腾讯云COS
-    storage_type: str = "cos"  # cos 或 s3
-    cos_secret_id: str = ""
-    cos_secret_key: str = ""
-    cos_bucket: str = "aigccloud-1234567890"
-    cos_region: str = "ap-shanghai"
-    cos_cdn_domain: str = ""
-
-    # 对象存储 - AWS S3
-    aws_access_key: str = ""
-    aws_secret_key: str = ""
-    aws_s3_bucket: str = "aigccloud"
-    aws_s3_region: str = "us-east-1"
-    aws_cdn_domain: str = ""
 
     # S3 统一配置（兼容 RustFS/MinIO/COS/S3）
     s3_endpoint: str = "http://localhost:9000"  # S3 API 端点
