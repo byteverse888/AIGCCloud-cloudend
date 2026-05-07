@@ -4,10 +4,11 @@
 import uuid
 import json
 import secrets
+import httpx
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from eth_account.messages import encode_defunct
 from web3 import Web3
 
@@ -23,6 +24,7 @@ from app.core.security import (
 )
 from app.core.config import settings
 from app.core.logger import logger
+from app.core.rate_limit import login_rate_limit, register_rate_limit, sms_rate_limit
 
 router = APIRouter()
 
@@ -132,7 +134,7 @@ async def get_captcha_image(captcha_id: str):
     )
 
 
-@router.post("/login", response_model=LoginResponse)
+@router.post("/login", response_model=LoginResponse, dependencies=[Depends(login_rate_limit)])
 async def login(request: LoginRequest):
     """
     用户登录
@@ -142,41 +144,23 @@ async def login(request: LoginRequest):
     logger.info(f"[登录] 用户尝试登录: {request.username}")
     try:
         # 通过Parse验证登录
-        import httpx
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{settings.parse_server_url}/login",
-                params={"username": request.username, "password": request.password},
-                headers={
-                    "X-Parse-Application-Id": settings.parse_app_id,
-                    "X-Parse-Revocable-Session": "1"
-                },
-                timeout=30.0
-            )
-        
-        if response.status_code != 200:
-            error_data = response.json()
+        try:
+            user_data = await parse_client.login_user(request.username, request.password)
+        except httpx.HTTPStatusError:
             logger.warning(f"[登录] 登录失败: {request.username}")
-            
             # 登录失败，检查用户是否存在
             try:
                 existing = await parse_client.query_users(where={"username": request.username})
                 if not existing.get("results"):
-                    # 用户不存在
                     raise HTTPException(status_code=404, detail="该用户名未注册")
                 else:
-                    # 用户存在，密码错误
                     raise HTTPException(status_code=401, detail="密码错误")
             except HTTPException:
                 raise
             except Exception as e:
                 logger.error(f"[登录] 检查用户失败: {str(e)}")
-                raise HTTPException(
-                    status_code=401, 
-                    detail=error_data.get("error", "用户名或密码错误")
-                )
+                raise HTTPException(status_code=401, detail="用户名或密码错误")
         
-        user_data = response.json()
         user_id = user_data.get("objectId")
         session_token = user_data.get("sessionToken")
         
@@ -190,19 +174,9 @@ async def login(request: LoginRequest):
         
         # 更新最后登录时间（使用 session token）
         try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                await client.put(
-                    f"{settings.parse_server_url}/users/{user_id}",
-                    json={"lastLoginAt": datetime.now().isoformat()},
-                    headers={
-                        "X-Parse-Application-Id": settings.parse_app_id,
-                        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-                        "X-Parse-Session-Token": session_token,
-                        "Content-Type": "application/json",
-                    },
-                    timeout=10.0
-                )
+            await parse_client.update_user_with_session(
+                user_id, {"lastLoginAt": datetime.now(timezone.utc).isoformat()}, session_token
+            )
         except Exception:
             pass
         
@@ -239,7 +213,7 @@ async def login(request: LoginRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/send-sms")
+@router.post("/send-sms", dependencies=[Depends(sms_rate_limit)])
 async def send_sms_code(request: SendSmsRequest):
     """
     发送短信验证码
@@ -329,19 +303,9 @@ async def phone_login(request: PhoneLoginRequest):
     # 更新最后登录时间（使用 session token）
     if session_token:
         try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                await client.put(
-                    f"{settings.parse_server_url}/users/{user_id}",
-                    json={"lastLoginAt": datetime.now().isoformat()},
-                    headers={
-                        "X-Parse-Application-Id": settings.parse_app_id,
-                        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-                        "X-Parse-Session-Token": session_token,
-                        "Content-Type": "application/json",
-                    },
-                    timeout=10.0
-                )
+            await parse_client.update_user_with_session(
+                user_id, {"lastLoginAt": datetime.now(timezone.utc).isoformat()}, session_token
+            )
         except Exception:
             pass
     
@@ -369,7 +333,7 @@ async def phone_login(request: PhoneLoginRequest):
     }
 
 
-@router.post("/email/register")
+@router.post("/email/register", dependencies=[Depends(register_rate_limit)])
 async def email_register(request: EmailRegisterRequest):
     """
     邮箱注册
@@ -393,7 +357,7 @@ async def email_register(request: EmailRegisterRequest):
     user_data = {
         "email": request.email,
         "password": request.password,
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     await redis_client.set_activation_token(token, user_data, ex=86400)
     
@@ -514,64 +478,49 @@ async def email_activate(token: str):
         raise HTTPException(status_code=500, detail="激活过程中发生异常")
 
 
-@router.post("/email/login")
+@router.post("/email/login", dependencies=[Depends(login_rate_limit)])
 async def email_login(request: EmailLoginRequest):
     """
     邮箱登录
     1. 使用 Parse 登录接口验证 (email作为username)
     2. 生成 JWT
     """
-    import httpx
     logger.info(f"[Auth] 邮箱登录请求: {request.email}")
     
-    login_url = f"{settings.parse_server_url}/login"
-    login_headers = {
-        "X-Parse-Application-Id": settings.parse_app_id,
-        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-        "X-Parse-Revocable-Session": "1",
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            login_url,
-            params={"username": request.email, "password": request.password},
-            headers=login_headers,
-            timeout=30.0
-        )
-    
-    if response.status_code == 200:
-        user_data = response.json()
-        session_token = user_data.get("sessionToken")
-        user_id = user_data.get("objectId")
-        
-        logger.info(f"[Auth] 邮箱登录成功: {request.email} (ID: {user_id})")
-        
-        # 更新登录时间
-        if session_token and user_id:
-            await _update_last_login(user_id, session_token, request.email)
-            
-        # 生成 JWT
-        jwt_token = create_access_token(data={
-            "sub": user_id,
-            "user_id": user_id,
-            "email": request.email,
-            "session_token": session_token,
-            "parse_session": session_token,
-        })
-        
-        # 构建响应
-        safe_user, parse_config = _build_user_response(user_data, session_token, "") # 邮箱登录暂无 address
-        
-        return {
-            "success": True,
-            "token": jwt_token,
-            "user": safe_user,
-            "parse_config": parse_config,
-            "message": "登录成功"
-        }
-    else:
-        logger.warning(f"[Auth] 邮箱登录失败: {request.email} - status={response.status_code}")
+    try:
+        user_data = await parse_client.login_user(request.email, request.password)
+    except httpx.HTTPStatusError:
+        logger.warning(f"[Auth] 邮箱登录失败: {request.email}")
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
+    
+    session_token = user_data.get("sessionToken")
+    user_id = user_data.get("objectId")
+    
+    logger.info(f"[Auth] 邮箱登录成功: {request.email} (ID: {user_id})")
+    
+    # 更新登录时间
+    if session_token and user_id:
+        await _update_last_login(user_id, session_token, request.email)
+    
+    # 生成 JWT
+    jwt_token = create_access_token(data={
+        "sub": user_id,
+        "user_id": user_id,
+        "email": request.email,
+        "session_token": session_token,
+        "parse_session": session_token,
+    })
+    
+    # 构建响应
+    safe_user, parse_config = _build_user_response(user_data, session_token, "") # 邮箱登录暂无 address
+    
+    return {
+        "success": True,
+        "token": jwt_token,
+        "user": safe_user,
+        "parse_config": parse_config,
+        "message": "登录成功"
+    }
 
 
 @router.post("/logout")
@@ -587,22 +536,11 @@ async def logout(
     
     # 清除 Parse session
     if parse_session:
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{settings.parse_server_url}/logout",
-                    headers={
-                        "X-Parse-Application-Id": settings.parse_app_id,
-                        "X-Parse-Session-Token": parse_session,
-                    },
-                    timeout=10.0
-                )
-            if response.status_code == 200:
-                logger.info(f"[Auth] Parse session 已清除")
-            else:
-                logger.warning(f"[Auth] Parse session 清除失败: {response.status_code} - {response.text}")
-        except Exception as e:
-            logger.warning(f"[Auth] Parse session 清除异常: {e}")
+        success = await parse_client.logout_session(parse_session)
+        if success:
+            logger.info(f"[Auth] Parse session 已清除")
+        else:
+            logger.warning(f"[Auth] Parse session 清除失败")
     
     # 可以将token加入黑名单（Redis）
     # await redis_client.set(f"blacklist:{token}", "1", ex=86400)
@@ -819,20 +757,10 @@ async def _verify_web3_signature(request: Web3LoginRequest):
 
 async def _update_last_login(user_id: str, session_token: str, address: str):
     """更新最后登录时间（使用 session token）"""
-    import httpx
     try:
-        async with httpx.AsyncClient() as client:
-            await client.put(
-                f"{settings.parse_server_url}/users/{user_id}",
-                json={"lastLoginAt": datetime.now().isoformat()},
-                headers={
-                    "X-Parse-Application-Id": settings.parse_app_id,
-                    "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-                    "X-Parse-Session-Token": session_token,
-                    "Content-Type": "application/json",
-                },
-                timeout=10.0
-            )
+        await parse_client.update_user_with_session(
+            user_id, {"lastLoginAt": datetime.now(timezone.utc).isoformat()}, session_token
+        )
         logger.debug(f"[Web3] 更新登录时间成功: {address[:10]}...")
     except Exception as e:
         logger.warning(f"[Web3] 更新登录时间失败: {e}")
@@ -868,7 +796,7 @@ def _build_user_response(user_data: dict, session_token: str, address: str):
     return safe_user, parse_config
 
 
-@router.post("/web3/register")
+@router.post("/web3/register", dependencies=[Depends(register_rate_limit)])
 async def web3_register(request: Web3LoginRequest):
     """
     Web3 注册 - 验证签名并创建新用户
@@ -879,7 +807,6 @@ async def web3_register(request: Web3LoginRequest):
     3. 创建 Parse User
     4. 返回 session token
     """
-    import httpx
     
     logger.info(f"[Web3] 注册请求: {request.address[:10]}...")
     
@@ -954,7 +881,7 @@ async def web3_register(request: Web3LoginRequest):
     }
 
 
-@router.post("/web3/login")
+@router.post("/web3/login", dependencies=[Depends(login_rate_limit)])
 async def web3_login(request: Web3LoginRequest):
     """
     Web3 登录 - 验证签名并登录已有用户
@@ -964,7 +891,6 @@ async def web3_login(request: Web3LoginRequest):
     2. 登录 Parse User
     3. 返回 session token
     """
-    import httpx
     
     logger.info(f"[Web3] 登录请求: {request.address[:10]}...")
     
@@ -972,85 +898,59 @@ async def web3_login(request: Web3LoginRequest):
     address, username = await _verify_web3_signature(request)
     
     # 登录 Parse
-    login_url = f"{settings.parse_server_url}/login"
-    login_headers = {
-        "X-Parse-Application-Id": settings.parse_app_id,
-        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-        "X-Parse-Revocable-Session": "1",
-    }
+    logger.debug(f"[Web3] 登录Parse: username={username}")
     
-    logger.debug(f"[Web3] 登录Parse: URL={login_url}, username={username}")
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            login_url,
-            params={"username": username, "password": request.password},
-            headers=login_headers,
-            timeout=30.0
-        )
-    
-    logger.debug(f"[Web3] 登录响应: status={response.status_code}")
-    
-    if response.status_code == 200:
-        user_data = response.json()
-        session_token = user_data.get("sessionToken")
-        user_id = user_data.get("objectId")
-        
-        logger.info(f"[Web3] 登录成功: {address[:10]}... (ID: {user_id})")
-        
-        # 更新登录时间
-        if session_token and user_id:
-            await _update_last_login(user_id, session_token, address)
-        
-        # 生成 JWT（包含 session_token）
-        jwt_token = create_access_token(data={
-            "sub": user_id,
-            "user_id": user_id,
-            "address": address,
-            "session_token": session_token,
-            "parse_session": session_token,
-        })
-        
-        # 构建响应
-        safe_user, parse_config = _build_user_response(user_data, session_token, address)
-        
-        return {
-            "success": True,
-            "token": jwt_token,  # 返回 JWT
-            "user": safe_user,
-            "parse_config": parse_config,
-            "is_new_user": False,
-            "message": "登录成功"
-        }
-    else:
-        # 解析 Parse Server 错误信息
+    try:
+        user_data = await parse_client.login_user(username, request.password)
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"[Web3] 登录失败: {address[:10]}...")
         try:
-            error_data = response.json()
+            error_data = e.response.json()
             error_code = error_data.get("code")
-            error_msg = error_data.get("error", "登录失败")
-            
-            logger.warning(f"[Web3] 登录失败: {address[:10]}... - code={error_code}, error={error_msg}")
-            
-            # Parse 错误码：101=用户名密码错误
             if error_code == 101:
                 raise HTTPException(status_code=401, detail="该地址未注册或密码错误")
-            else:
-                raise HTTPException(status_code=401, detail=error_msg)
-        except ValueError:
-            # 无法解析 JSON
-            error_text = response.text
-            logger.warning(f"[Web3] 登录失败: {address[:10]}... - status={response.status_code}, error={error_text}")
+            raise HTTPException(status_code=401, detail=error_data.get("error", "登录失败"))
+        except (ValueError, AttributeError):
             raise HTTPException(status_code=401, detail="登录失败，请检查账户和密码")
+    
+    session_token = user_data.get("sessionToken")
+    user_id = user_data.get("objectId")
+    
+    logger.info(f"[Web3] 登录成功: {address[:10]}... (ID: {user_id})")
+    
+    # 更新登录时间
+    if session_token and user_id:
+        await _update_last_login(user_id, session_token, address)
+    
+    # 生成 JWT（包含 session_token）
+    jwt_token = create_access_token(data={
+        "sub": user_id,
+        "user_id": user_id,
+        "address": address,
+        "session_token": session_token,
+        "parse_session": session_token,
+    })
+    
+    # 构建响应
+    safe_user, parse_config = _build_user_response(user_data, session_token, address)
+    
+    return {
+        "success": True,
+        "token": jwt_token,
+        "user": safe_user,
+        "parse_config": parse_config,
+        "is_new_user": False,
+        "message": "登录成功"
+    }
 
 
 
-@router.post("/web3/simple-login")
+@router.post("/web3/simple-login", dependencies=[Depends(login_rate_limit)])
 async def web3_simple_login(request: Web3SimpleLoginRequest):
     """
     Web3 简单登录 - 仅需地址+密码（无需签名）
     适用于已注册用户的快速登录，免去私钥签名步骤
     """
-    import httpx
     
     logger.info(f"[Web3] 简单登录请求: {request.address[:10]}...")
     
@@ -1061,58 +961,44 @@ async def web3_simple_login(request: Web3SimpleLoginRequest):
         raise HTTPException(status_code=400, detail="密码至少6位")
     
     # 直接调用 Parse 登录
-    login_url = f"{settings.parse_server_url}/login"
-    login_headers = {
-        "X-Parse-Application-Id": settings.parse_app_id,
-        "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-        "X-Parse-Revocable-Session": "1",
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            login_url,
-            params={"username": username, "password": request.password},
-            headers=login_headers,
-            timeout=30.0
-        )
-    
-    if response.status_code == 200:
-        user_data = response.json()
-        session_token = user_data.get("sessionToken")
-        user_id = user_data.get("objectId")
-        
-        logger.info(f"[Web3] 简单登录成功: {address[:10]}... (ID: {user_id})")
-        
-        if session_token and user_id:
-            await _update_last_login(user_id, session_token, address)
-        
-        jwt_token = create_access_token(data={
-            "sub": user_id,
-            "user_id": user_id,
-            "address": address,
-            "session_token": session_token,
-            "parse_session": session_token,
-        })
-        
-        safe_user, parse_config = _build_user_response(user_data, session_token, address)
-        
-        return {
-            "success": True,
-            "token": jwt_token,
-            "user": safe_user,
-            "parse_config": parse_config,
-            "is_new_user": False,
-            "message": "登录成功"
-        }
-    else:
+    try:
+        user_data = await parse_client.login_user(username, request.password)
+    except httpx.HTTPStatusError as e:
         try:
-            error_data = response.json()
+            error_data = e.response.json()
             error_code = error_data.get("code")
             if error_code == 101:
                 raise HTTPException(status_code=401, detail="地址未注册或密码错误")
             raise HTTPException(status_code=401, detail=error_data.get("error", "登录失败"))
-        except ValueError:
+        except (ValueError, AttributeError):
             raise HTTPException(status_code=401, detail="登录失败，请检查账户和密码")
+    
+    session_token = user_data.get("sessionToken")
+    user_id = user_data.get("objectId")
+    
+    logger.info(f"[Web3] 简单登录成功: {address[:10]}... (ID: {user_id})")
+    
+    if session_token and user_id:
+        await _update_last_login(user_id, session_token, address)
+    
+    jwt_token = create_access_token(data={
+        "sub": user_id,
+        "user_id": user_id,
+        "address": address,
+        "session_token": session_token,
+        "parse_session": session_token,
+    })
+    
+    safe_user, parse_config = _build_user_response(user_data, session_token, address)
+    
+    return {
+        "success": True,
+        "token": jwt_token,
+        "user": safe_user,
+        "parse_config": parse_config,
+        "is_new_user": False,
+        "message": "登录成功"
+    }
 
 
 @router.post("/web3/logout")
@@ -1127,7 +1013,6 @@ async def web3_logout(
     2. 调用 Parse Server 撤销 sessionToken
     3. 客户端清除本地存储
     """
-    import httpx
     
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未提供认证Token")
@@ -1148,22 +1033,12 @@ async def web3_logout(
             raise HTTPException(status_code=400, detail="无效的认证Token")
         
         # 调用 Parse Server 登出接口撤销 sessionToken
-        logout_url = f"{settings.parse_server_url}/logout"
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                logout_url,
-                headers={
-                    "X-Parse-Application-Id": settings.parse_app_id,
-                    "X-Parse-REST-API-Key": settings.parse_rest_api_key,
-                    "X-Parse-Session-Token": session_token,
-                },
-                timeout=10.0
-            )
+        success = await parse_client.logout_session(session_token)
         
-        if response.status_code == 200:
+        if success:
             logger.info(f"[Web3] 登出成功: session_token={session_token[:20]}...")
         else:
-            logger.warning(f"[Web3] Parse 登出失败: status={response.status_code}")
+            logger.warning(f"[Web3] Parse 登出失败")
         
         # 可选：将 JWT 加入黑名单
         # await redis_client.set(f"jwt_blacklist:{token}", "1", ex=86400)

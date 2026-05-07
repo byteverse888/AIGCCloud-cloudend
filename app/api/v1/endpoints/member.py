@@ -2,7 +2,7 @@
 会员订阅接口
 """
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Header
@@ -128,7 +128,7 @@ async def subscribe_member(request: SubscribeRequest):
             expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
             if expire_dt.tzinfo:
                 expire_dt = expire_dt.replace(tzinfo=None)
-            is_active = expire_dt > datetime.now()
+            is_active = expire_dt > datetime.now(timezone.utc)
         except Exception as e:
             logger.warning(f"[会员订阅] 解析到期时间失败: {e}")
     
@@ -141,7 +141,7 @@ async def subscribe_member(request: SubscribeRequest):
         )
     
     # 4. 创建订单
-    order_id = f"MO{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
+    order_id = f"MO{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
     order_data = {
         "orderId": order_id,
         "userId": request.user_id,
@@ -376,7 +376,7 @@ async def get_order_status(
                 return {
                     "order_id": order_id,
                     "status": "paid",
-                    "paid_at": datetime.now().isoformat(),
+                    "paid_at": datetime.now(timezone.utc).isoformat(),
                 }
         except Exception as e:
             logger.error(f"[订单状态] 查询微信支付失败: {e}")
@@ -429,7 +429,7 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
             {"orderId": order_id},
             {
                 "status": "paid",
-                "paidAt": datetime.now().isoformat(),
+                "paidAt": datetime.now(timezone.utc).isoformat(),
             },
         )
         logger.info(f"[会员订单] 订单状态已更新为 paid")
@@ -469,7 +469,7 @@ async def complete_member_order(order_id: str, order: dict, session_token: Optio
     current_priority = LEVEL_PRIORITY.get(current_level, 0)
     new_priority = LEVEL_PRIORITY.get(new_level, 0)
     
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     is_active = False  # 当前会员是否有效
     
     if current_expire:

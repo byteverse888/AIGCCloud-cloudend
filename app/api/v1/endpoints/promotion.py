@@ -46,7 +46,7 @@ async def get_promotion_link(user_id: str = Depends(get_current_user_id)):
     invite_code = user_id[:8]
     
     # 获取前端基础URL
-    base_url = "https://aigccloud.example.com"  # 从配置获取
+    base_url = settings.frontend_url.rstrip("/")
     invite_link = f"{base_url}/register?ref={invite_code}"
     
     return {
@@ -78,7 +78,7 @@ async def get_promotion_stats(user_id: str = Depends(get_current_user_id)):
     total_invite_reward = sum(item.get("amount", 0) for item in result.get("results", []))
     
     invite_code = user_id[:8]
-    base_url = "https://aigccloud.example.com"
+    base_url = settings.frontend_url.rstrip("/")
     
     return PromotionStats(
         invite_count=invite_count,

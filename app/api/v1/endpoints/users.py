@@ -1,10 +1,15 @@
 """
 用户管理端点
 """
-from fastapi import APIRouter, HTTPException, Depends, Request
+import json
+import httpx
+from decimal import Decimal
+from fastapi import APIRouter, HTTPException, Depends, Request, Header
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
+from eth_account import Account
+from web3 import Web3
 
 from app.core.parse_client import parse_client
 from app.core.redis_client import redis_client
@@ -15,10 +20,12 @@ from app.core.security import (
     generate_activation_token, 
     generate_reset_token,
     is_valid_ethereum_address,
-    checksum_address
+    checksum_address,
+    decode_access_token,
 )
 from app.core.deps import get_current_user_id, get_admin_user_id
 from app.core.config import settings
+from app.core.logger import logger
 
 router = APIRouter()
 
@@ -121,7 +128,7 @@ async def register_user(request: UserRegisterRequest, req: Request):
         "email": request.email,
         "password": request.password,  # 存储原始密码，激活时再hash
         "invite_code": request.invite_code,
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     await redis_client.set_activation_token(token, user_data, ex=86400)
     
@@ -162,12 +169,12 @@ async def register_phone(request: PhoneRegisterRequest):
         raise HTTPException(status_code=400, detail="该手机号已注册")
     
     # 3. 生成用户名（如果未提供）
-    username = request.username or f"user_{phone[-4:]}{datetime.now().strftime('%m%d%H%M')}"
+    username = request.username or f"user_{phone[-4:]}{datetime.now(timezone.utc).strftime('%m%d%H%M')}"
     
     # 检查用户名是否已存在
     existing_username = await parse_client.query_users(where={"username": username})
     if existing_username.get("results"):
-        username = f"{username}_{datetime.now().strftime('%S')}"
+        username = f"{username}_{datetime.now(timezone.utc).strftime('%S')}"
     
     # 4. 创建用户
     extra_data = {
@@ -361,8 +368,6 @@ async def change_password(
     1. 通过 Parse Server 验证当前密码
     2. 使用 Master Key 更新为新密码
     """
-    from app.core.logger import logger
-    import httpx
 
     logger.info(f"[User] 用户 {user_id} 请求修改密码")
 
@@ -383,7 +388,6 @@ async def change_password(
         raise HTTPException(status_code=500, detail="获取用户信息失败")
 
     # 2. 通过 Parse Server 登录验证当前密码
-    from app.core.config import settings
     login_url = f"{settings.parse_server_url}/login"
     login_headers = {
         "X-Parse-Application-Id": settings.parse_app_id,
@@ -427,7 +431,6 @@ async def bind_web3_address(
     """
     绑定Web3地址到用户账号
     """
-    from app.core.logger import logger
     
     # 验证地址格式
     if not is_valid_ethereum_address(request.web3_address):
@@ -642,7 +645,6 @@ async def create_wallet(
     1. 验证 web3 地址格式
     2. 将加密后的 keystore 和地址保存到 Parse User
     """
-    from app.core.logger import logger
     
     logger.info(f"[Wallet] 用户 {user_id} 创建钱包: {request.web3_address}")
     
@@ -656,9 +658,6 @@ async def create_wallet(
         raise HTTPException(status_code=400, detail="该钱包地址已被绑定")
     
     # 获取当前用户的 session token
-    from app.core.security import decode_access_token
-    from fastapi import Header
-    from app.core.config import settings
     
     # 更新用户信息
     try:
@@ -692,7 +691,6 @@ async def import_wallet(
     1. 验证 web3 地址格式
     2. 将加密后的 keystore 和地址保存到 Parse User
     """
-    from app.core.logger import logger
     
     logger.info(f"[Wallet] 用户 {user_id} 导入钱包: {request.web3_address}")
     
@@ -740,9 +738,6 @@ async def transfer(
     2. 使用密码解密 keystore 恢复钱包
     3. 执行转账
     """
-    from app.core.logger import logger
-    from eth_account import Account
-    import json
     
     logger.info(f"[Wallet] 用户 {user_id} 请求转账: {request.amount} ETH -> {request.to_address}")
     
@@ -775,8 +770,6 @@ async def transfer(
             raise HTTPException(status_code=400, detail="密码错误或 keystore 无效")
         
         # 3. 执行转账
-        from web3 import Web3
-        from decimal import Decimal
         
         # 连接 Web3
         if not settings.web3_rpc_url:
@@ -838,7 +831,6 @@ async def unbind_wallet(
     解绑钱包
     删除用户的 web3Address 和 encryptedKeystore
     """
-    from app.core.logger import logger
     
     logger.info(f"[Wallet] 用户 {user_id} 请求解绑钱包")
     

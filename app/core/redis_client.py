@@ -152,15 +152,15 @@ class RedisClient:
     
     async def set_daily_claim_flag(self, user_id: str) -> bool:
         """设置每日领取标记(24h过期)"""
-        from datetime import datetime
-        today = datetime.now().strftime("%Y-%m-%d")
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         key = f"daily_claim:{today}:{user_id}"
         return await self.set(key, "1", ex=86400)  # 24小时
     
     async def check_daily_claim(self, user_id: str) -> bool:
         """检查今日是否已领取"""
-        from datetime import datetime
-        today = datetime.now().strftime("%Y-%m-%d")
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         key = f"daily_claim:{today}:{user_id}"
         return await self.exists(key)
     

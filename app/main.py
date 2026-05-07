@@ -4,9 +4,11 @@ AIGC Cloud Platform API
 """
 import os
 import signal
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import httpx
 
 from app.core.config import settings
 from app.core.redis_client import redis_client
@@ -39,6 +41,13 @@ async def lifespan(app: FastAPI):
         logger.info("Parse Schema 初始化完成")
     except Exception as e:
         logger.error(f"Parse Schema 初始化失败: {e}")
+    
+    # 创建默认管理员/运营用户
+    try:
+        await parse_client.ensure_default_users()
+        logger.info("默认用户初始化完成")
+    except Exception as e:
+        logger.error(f"默认用户初始化失败: {e}")
     
     # 初始化 ARQ 连接池
     try:
@@ -89,6 +98,13 @@ async def lifespan(app: FastAPI):
         logger.info("Redis disconnected")
     except Exception:
         pass
+    
+    # 关闭 Parse 连接池
+    try:
+        await parse_client.close()
+        logger.info("Parse client closed")
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -121,7 +137,7 @@ Authorization: Bearer <token>
 # CORS 配置
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应限制为具体域名
+    allow_origins=settings.frontend_url.split(",") if not settings.debug else ["*"],  # 生产环境限制具体域名
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -129,6 +145,38 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(api_v1_router, prefix="/api/v1")
+
+
+# ============ 全局异常处理器 ============
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """捕获所有未处理的异常，返回统一 JSON 格式"""
+    logger.error(f"[Unhandled] {request.method} {request.url.path} -> {type(exc).__name__}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "detail": "服务器内部错误，请稍后重试"},
+    )
+
+
+@app.exception_handler(httpx.ConnectError)
+async def httpx_connect_error_handler(request: Request, exc: httpx.ConnectError):
+    """Parse Server 连接失败时的友好响应"""
+    logger.error(f"[ConnectError] {request.method} {request.url.path} -> {exc}")
+    return JSONResponse(
+        status_code=502,
+        content={"success": False, "detail": "上游服务暂不可用，请稍后重试"},
+    )
+
+
+@app.exception_handler(httpx.TimeoutException)
+async def httpx_timeout_handler(request: Request, exc: httpx.TimeoutException):
+    """上游超时的友好响应"""
+    logger.error(f"[Timeout] {request.method} {request.url.path} -> {exc}")
+    return JSONResponse(
+        status_code=504,
+        content={"success": False, "detail": "请求超时，请稍后重试"},
+    )
 
 
 @app.get("/", tags=["Root"])

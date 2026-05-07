@@ -1,7 +1,7 @@
 """
 ARQ 任务定义
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.core.logger import logger
 from app.core.parse_client import parse_client
 from app.core.wechat_pay import wechat_pay
@@ -75,7 +75,7 @@ async def process_paid_order(ctx, order_object_id: str):
                 await parse_client.update_object(
                     "Order",
                     order_object_id,
-                    {"status": "completed", "completedAt": datetime.now().isoformat()}
+                    {"status": "completed", "completedAt": datetime.now(timezone.utc).isoformat()}
                 )
                 logger.info(f"[ARQ] 用户 {user_id} 充值订单完成: {coins} 金币")
                 
@@ -134,7 +134,7 @@ async def process_paid_tx_orders(ctx):
                     
                     await parse_client.update_object("Order", order_id, {
                         "status": "completed",
-                        "completedAt": datetime.now().isoformat()
+                        "completedAt": datetime.now(timezone.utc).isoformat()
                     })
                     logger.info(f"[ARQ] 订单已完成: {order_id}")
                     processed += 1
@@ -303,7 +303,7 @@ async def settle_pending_incentives(ctx):
             user_pending[uid]["logs"].append(log)
         
         settled_count = 0
-        batch_id = f"batch_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        batch_id = f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
         
         for user_id, info in user_pending.items():
             pending_coins = info["amount"]
@@ -318,7 +318,7 @@ async def settle_pending_incentives(ctx):
                 
                 if mint_result.get("success"):
                     tx_hash = mint_result.get("tx_hash", "")
-                    settled_at = datetime.now().isoformat()
+                    settled_at = datetime.now(timezone.utc).isoformat()
                     
                     # 3. 更新该用户所有 pending 的 IncentiveLog
                     for log in info["logs"]:

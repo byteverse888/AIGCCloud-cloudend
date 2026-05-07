@@ -27,6 +27,36 @@ class ParseClient:
             "X-Parse-Master-Key": self.master_key,
             "Content-Type": "application/json",
         }
+        # 全局连接池（复用 TCP 连接，避免每次请求建立新连接）
+        self._client: Optional[httpx.AsyncClient] = None
+        self._master_client: Optional[httpx.AsyncClient] = None
+    
+    async def _get_client(self) -> httpx.AsyncClient:
+        """获取普通请求客户端（带连接池）"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                headers=self.headers,
+                timeout=30.0,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            )
+        return self._client
+    
+    async def _get_master_client(self) -> httpx.AsyncClient:
+        """获取 Master Key 请求客户端（带连接池）"""
+        if self._master_client is None or self._master_client.is_closed:
+            self._master_client = httpx.AsyncClient(
+                headers=self.master_headers,
+                timeout=30.0,
+                limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+            )
+        return self._master_client
+    
+    async def close(self):
+        """关闭连接池（应用关闭时调用）"""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        if self._master_client and not self._master_client.is_closed:
+            await self._master_client.aclose()
     
     async def _request(
         self, 
@@ -35,45 +65,40 @@ class ParseClient:
         data: Optional[Dict] = None,
         params: Optional[Dict] = None
     ) -> Dict[str, Any]:
-        """发送请求到 Parse Server"""
+        """发送请求到 Parse Server（使用连接池）"""
         url = f"{self.base_url}{endpoint}"
         
         # 调试日志：请求信息
         logger.debug(f"[Parse] 请求: {method} {url}")
-        logger.debug(f"[Parse] Headers: App-Id={self.app_id[:8]}..., REST-Key={self.rest_api_key[:8] if self.rest_api_key else 'N/A'}...")
         if data:
-            # 隐藏敏感字段
             safe_data = {k: ('***' if k in ['password'] else v) for k, v in data.items()}
             logger.debug(f"[Parse] Body: {json_lib.dumps(safe_data, ensure_ascii=False)}")
         if params:
             logger.debug(f"[Parse] Params: {params}")
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    headers=self.headers,
-                    json=data,
-                    params=params,
-                    timeout=30.0
-                )
-                
-                # 调试日志：响应信息
-                logger.debug(f"[Parse] 响应: {response.status_code}")
-                if response.status_code >= 400:
-                    logger.error(f"[Parse] 错误响应: {response.text}")
-                
-                response.raise_for_status()
-                result = response.json()
-                logger.debug(f"[Parse] 成功: {str(result)[:200]}...")
-                return result
-            except httpx.HTTPStatusError as e:
-                logger.error(f"[Parse] HTTP错误: {e.response.status_code} - {e.response.text}")
-                raise
-            except Exception as e:
-                logger.error(f"[Parse] 请求异常: {str(e)}")
-                raise
+        client = await self._get_client()
+        try:
+            response = await client.request(
+                method=method,
+                url=url,
+                json=data,
+                params=params,
+            )
+            
+            logger.debug(f"[Parse] 响应: {response.status_code}")
+            if response.status_code >= 400:
+                logger.error(f"[Parse] 错误响应: {response.text}")
+            
+            response.raise_for_status()
+            result = response.json()
+            logger.debug(f"[Parse] 成功: {str(result)[:200]}...")
+            return result
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[Parse] HTTP错误: {e.response.status_code} - {e.response.text}")
+            raise
+        except Exception as e:
+            logger.error(f"[Parse] 请求异常: {str(e)}")
+            raise
     
     # ============ 对象操作 ============
     
@@ -176,35 +201,26 @@ class ParseClient:
     async def get_user(self, user_id: str) -> Dict[str, Any]:
         """获取用户信息（使用 Master Key）"""
         url = f"{self.base_url}/users/{user_id}"
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    url,
-                    headers=self.master_headers,
-                    timeout=30.0
-                )
-                if response.status_code >= 400:
-                    logger.error(f"[Parse] 获取用户失败: {response.text}")
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                logger.error(f"[Parse] 获取用户异常: {str(e)}")
-                raise
+        client = await self._get_master_client()
+        try:
+            response = await client.get(url)
+            if response.status_code >= 400:
+                logger.error(f"[Parse] 获取用户失败: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"[Parse] 获取用户异常: {str(e)}")
+            raise
     
     async def get_current_user(self, session_token: str) -> Dict[str, Any]:
         """通过 session token 获取当前用户信息"""
-        headers = {
-            **self.headers,
-            "X-Parse-Session-Token": session_token,
-        }
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.base_url}/users/me",
-                headers=headers,
-                timeout=30.0
-            )
-            response.raise_for_status()
-            return response.json()
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.base_url}/users/me",
+            headers={"X-Parse-Session-Token": session_token},
+        )
+        response.raise_for_status()
+        return response.json()
     
     async def validate_session(self, session_token: str, expected_user_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -242,53 +258,80 @@ class ParseClient:
         """更新用户信息（需要 Master Key 或正确的 Session Token）"""
         return await self._request("PUT", f"/users/{user_id}", data)
     
+    async def login_user(self, username: str, password: str) -> Dict[str, Any]:
+        """通过 Parse Server 验证用户名密码登录
+        
+        Returns:
+            成功时返回用户数据（含 sessionToken）
+            
+        Raises:
+            httpx.HTTPStatusError: 登录失败时抛出
+        """
+        url = f"{self.base_url}/login"
+        client = await self._get_client()
+        response = await client.get(
+            url,
+            params={"username": username, "password": password},
+            headers={"X-Parse-Revocable-Session": "1"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def logout_session(self, session_token: str) -> bool:
+        """撤销 Parse session token
+        
+        Returns:
+            True 表示登出成功，False 表示失败（不抛异常）
+        """
+        url = f"{self.base_url}/logout"
+        client = await self._get_client()
+        try:
+            response = await client.post(
+                url,
+                headers={"X-Parse-Session-Token": session_token},
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logger.warning(f"[Parse] logout 失败: {e}")
+            return False
+
     async def update_user_with_master_key(self, user_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """使用 Master Key 更新用户信息（用于 emailVerified 等敏感字段）"""
         url = f"{self.base_url}/users/{user_id}"
         logger.info(f"[Parse] 更新用户(Master): {user_id}, 数据: {data}")
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.put(
-                    url,
-                    headers=self.master_headers,
-                    json=data,
-                    timeout=30.0
-                )
-                logger.info(f"[Parse] 更新用户响应: {response.status_code}")
-                if response.status_code >= 400:
-                    logger.error(f"[Parse] 更新用户失败: {response.text}")
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                logger.error(f"[Parse] 更新用户异常: {e}")
-                raise
+        client = await self._get_master_client()
+        try:
+            response = await client.put(url, json=data)
+            logger.info(f"[Parse] 更新用户响应: {response.status_code}")
+            if response.status_code >= 400:
+                logger.error(f"[Parse] 更新用户失败: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"[Parse] 更新用户异常: {e}")
+            raise
     
     async def update_user_with_session(self, user_id: str, data: Dict[str, Any], session_token: str) -> Dict[str, Any]:
         """使用 session token 更新用户信息"""
-        headers = {
-            **self.headers,
-            "X-Parse-Session-Token": session_token,
-        }
         url = f"{self.base_url}/users/{user_id}"
         logger.info(f"[Parse] 更新用户(session): {user_id}, 数据: {data}")
         
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.put(
-                    url,
-                    headers=headers,
-                    json=data,
-                    timeout=30.0
-                )
-                logger.info(f"[Parse] 更新用户响应: {response.status_code}")
-                if response.status_code >= 400:
-                    logger.error(f"[Parse] 更新用户失败: {response.text}")
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                logger.error(f"[Parse] 更新用户异常: {e}")
-                raise
+        client = await self._get_client()
+        try:
+            response = await client.put(
+                url,
+                json=data,
+                headers={"X-Parse-Session-Token": session_token},
+            )
+            logger.info(f"[Parse] 更新用户响应: {response.status_code}")
+            if response.status_code >= 400:
+                logger.error(f"[Parse] 更新用户失败: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"[Parse] 更新用户异常: {e}")
+            raise
     
     async def query_users(
         self, 
@@ -297,10 +340,7 @@ class ParseClient:
         limit: int = 100,
         skip: int = 0
     ) -> Dict[str, Any]:
-        """查询用户列表
-        
-        使用 Master Key 查询 /classes/_User
-        """
+        """查询用户列表（使用 Master Key 查询 /classes/_User）"""
         import json
         params = {"limit": limit, "skip": skip}
         if where:
@@ -308,24 +348,18 @@ class ParseClient:
         if order:
             params["order"] = order
         
-        # 使用 Master Key 查询
         url = f"{self.base_url}/classes/_User"
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    url,
-                    headers=self.master_headers,
-                    params=params,
-                    timeout=30.0
-                )
-                logger.debug(f"[Parse] 查询用户: {response.status_code}")
-                if response.status_code >= 400:
-                    logger.error(f"[Parse] 查询用户失败: {response.text}")
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                logger.error(f"[Parse] 查询用户异常: {str(e)}")
-                raise
+        client = await self._get_master_client()
+        try:
+            response = await client.get(url, params=params)
+            logger.debug(f"[Parse] 查询用户: {response.status_code}")
+            if response.status_code >= 400:
+                logger.error(f"[Parse] 查询用户失败: {response.text}")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"[Parse] 查询用户异常: {str(e)}")
+            raise
     
     # ============ 云函数调用 ============
     
@@ -357,15 +391,30 @@ class ParseClient:
             "failReason": {"type": "String"}
         },
         "Product": {
+            "name": {"type": "String"},
+            "description": {"type": "String"},
+            "cover": {"type": "String"},
+            "price": {"type": "Number"},
             "owner": {"type": "String"},
             "status": {"type": "String"},
             "category": {"type": "String"},
             "creatorId": {"type": "String"},
+            "creatorName": {"type": "String"},
+            "creatorAddress": {"type": "String"},
+            "mockType": {"type": "String"},
+            "mockOwner": {"type": "String"},
+            "sales": {"type": "Number"},
+            "likeCount": {"type": "Number"},
+            "favoriteCount": {"type": "Number"},
+            "views": {"type": "Number"},
+            "rating": {"type": "Number"},
+            "commentCount": {"type": "Number"},
+            "tags": {"type": "Array"},
             "reportCount": {"type": "Number"},
             "reviewedAt": {"type": "String"},
             "reviewedBy": {"type": "String"},
             "reviewNote": {"type": "String"},
-            "offlineReason": {"type": "String"}
+            "offlineReason": {"type": "String"},
         },
         "MemberOrder": {
             "orderId": {"type": "String"},
@@ -468,104 +517,235 @@ class ParseClient:
             "targetId": {"type": "String"},
             "targetClass": {"type": "String"},
             "action": {"type": "String"},
-        }
+        },
+        # AIIP资产
+        "AIIPAsset": {
+            "name": {"type": "String"},
+            "category": {"type": "String"},
+            "description": {"type": "String"},
+            "cover": {"type": "String"},
+            "status": {"type": "String"},
+            "price": {"type": "Number"},
+            "ownerId": {"type": "String"},
+            "ownerAddress": {"type": "String"},
+            "ownerName": {"type": "String"},
+            "mockOwner": {"type": "String"},
+            "views": {"type": "Number"},
+            "isListed": {"type": "Boolean"},
+            "tags": {"type": "Array"},
+        },
+        # 评论
+        "Comment": {
+            "productId": {"type": "String"},
+            "userId": {"type": "String"},
+            "userName": {"type": "String"},
+            "userAvatar": {"type": "String"},
+            "content": {"type": "String"},
+            "rating": {"type": "Number"},
+            "parentId": {"type": "String"},
+            "likeCount": {"type": "Number"},
+        },
+        # 点赞
+        "Like": {
+            "productId": {"type": "String"},
+            "userId": {"type": "String"},
+        },
+        # 收藏
+        "Favorite": {
+            "productId": {"type": "String"},
+            "userId": {"type": "String"},
+        },
+        # 关注
+        "Follow": {
+            "followerId": {"type": "String"},
+            "followingId": {"type": "String"},
+        },
+        # 提现申请
+        "WithdrawRequest": {
+            "userId": {"type": "String"},
+            "amount": {"type": "Number"},
+            "method": {"type": "String"},
+            "account": {"type": "String"},
+            "accountName": {"type": "String"},
+            "status": {"type": "String"},
+        },
+        # 收益记录
+        "EarningRecord": {
+            "userId": {"type": "String"},
+            "type": {"type": "String"},
+            "amount": {"type": "Number"},
+            "description": {"type": "String"},
+            "status": {"type": "String"},
+        },
+        # 券码
+        "Coupon": {
+            "code": {"type": "String"},
+            "type": {"type": "String"},
+            "value": {"type": "Number"},
+            "minAmount": {"type": "Number"},
+            "scope": {"type": "String"},
+            "scopeDetail": {"type": "String"},
+            "startDate": {"type": "String"},
+            "endDate": {"type": "String"},
+            "totalCount": {"type": "Number"},
+            "usedCount": {"type": "Number"},
+            "status": {"type": "String"},
+            "createdBy": {"type": "String"},
+        },
+        # 促销活动
+        "Promotion": {
+            "name": {"type": "String"},
+            "type": {"type": "String"},
+            "status": {"type": "String"},
+            "discount": {"type": "Number"},
+            "minAmount": {"type": "Number"},
+            "giftProduct": {"type": "String"},
+            "startDate": {"type": "String"},
+            "endDate": {"type": "String"},
+            "productCount": {"type": "Number"},
+            "orderCount": {"type": "Number"},
+            "revenue": {"type": "Number"},
+            "createdBy": {"type": "String"},
+        },
+        # 充值方案
+        "RechargePlan": {
+            "amount": {"type": "Number"},
+            "bonus": {"type": "Number"},
+            "enabled": {"type": "Boolean"},
+        },
+        # 充值记录
+        "RechargeRecord": {
+            "userId": {"type": "String"},
+            "username": {"type": "String"},
+            "amount": {"type": "Number"},
+            "bonus": {"type": "Number"},
+            "method": {"type": "String"},
+            "status": {"type": "String"},
+        },
+        # 平台账户明细
+        "AccountRecord": {
+            "type": {"type": "String"},
+            "category": {"type": "String"},
+            "amount": {"type": "Number"},
+            "balance": {"type": "Number"},
+            "description": {"type": "String"},
+            "relatedOrderNo": {"type": "String"},
+        },
+        # 系统配置
+        "SystemConfig": {
+            "key": {"type": "String"},
+            "value": {"type": "String"},
+            "label": {"type": "String"},
+            "group": {"type": "String"},
+        },
+        # 商品举报
+        "ProductReport": {
+            "productId": {"type": "String"},
+            "userId": {"type": "String"},
+            "reason": {"type": "String"},
+            "description": {"type": "String"},
+            "status": {"type": "String"},
+        },
     }
     
-    # 默认 CLP：所有客户端可读写（开发阶段）
-    DEFAULT_CLP = {
-        "find": {"*": True},
-        "count": {"*": True},
-        "get": {"*": True},
-        "create": {"*": True},
-        "update": {"*": True},
-        "delete": {"*": True},
-        "addField": {"*": True},
-    }
+    # CLP 权限配置：根据环境区分
+    # 开发环境：全开放；生产环境：限制 addField 仅 Master Key
+    @property
+    def DEFAULT_CLP(self) -> dict:
+        if settings.debug:
+            return {
+                "find": {"*": True},
+                "count": {"*": True},
+                "get": {"*": True},
+                "create": {"*": True},
+                "update": {"*": True},
+                "delete": {"*": True},
+                "addField": {"*": True},
+            }
+        return {
+            "find": {"*": True},
+            "count": {"*": True},
+            "get": {"*": True},
+            "create": {"*": True},
+            "update": {"*": True},
+            "delete": {"requiresAuthentication": True},
+            "addField": {},  # 仅 Master Key 可添加字段
+        }
     
     async def ensure_schema(self):
         """确保所有业务类在 Parse Server 中存在并包含正确类型的字段（Schema API + Master Key）"""
-        async with httpx.AsyncClient() as client:
-            for class_name, fields in self.SCHEMA_DEFINITIONS.items():
-                try:
-                    # 用 Schema API 检查类是否存在
-                    resp = await client.get(
-                        f"{self.base_url}/schemas/{class_name}",
-                        headers=self.master_headers,
-                        timeout=10.0,
-                    )
-                    if resp.status_code == 200:
-                        existing = resp.json().get("fields", {})
-                        missing = {}
-                        type_mismatch = {}
-                        for k, v in fields.items():
-                            if k not in existing:
-                                missing[k] = v
-                            elif existing[k].get("type") != v.get("type"):
-                                type_mismatch[k] = v
-                        
-                        # 先删除类型不匹配的字段，再重新添加
-                        if type_mismatch:
-                            logger.warning(f"[Parse] 字段类型不匹配 {class_name}: {list(type_mismatch.keys())}")
-                            delete_fields = {k: {"__op": "Delete"} for k in type_mismatch}
-                            del_resp = await client.put(
-                                f"{self.base_url}/schemas/{class_name}",
-                                headers=self.master_headers,
-                                json={"className": class_name, "fields": delete_fields},
-                                timeout=10.0,
-                            )
-                            if del_resp.status_code == 200:
-                                missing.update(type_mismatch)
-                                logger.info(f"[Parse] 旧字段已删除，将重建: {list(type_mismatch.keys())}")
-                            else:
-                                logger.error(f"[Parse] 删除字段失败: {class_name} - {del_resp.text}")
-                        
-                        # 添加缺少的字段（含类型修复后重建的）
-                        if missing:
-                            logger.info(f"[Parse] 补充字段 {class_name}: {list(missing.keys())}")
-                            add_resp = await client.put(
-                                f"{self.base_url}/schemas/{class_name}",
-                                headers=self.master_headers,
-                                json={"className": class_name, "fields": missing},
-                                timeout=10.0,
-                            )
-                            if add_resp.status_code == 200:
-                                logger.info(f"[Parse] 字段补充成功: {class_name}")
-                            else:
-                                logger.error(f"[Parse] 字段补充失败: {class_name} - {add_resp.text}")
-                        else:
-                            logger.debug(f"[Parse] Schema OK: {class_name}")
-                        
-                        # 确保 CLP 正确（防止默认权限过严导致客户端无法访问）
-                        await self._ensure_clp(client, class_name)
-                        continue
+        client = await self._get_master_client()
+        for class_name, fields in self.SCHEMA_DEFINITIONS.items():
+            try:
+                # 用 Schema API 检查类是否存在
+                resp = await client.get(
+                    f"{self.base_url}/schemas/{class_name}",
+                )
+                if resp.status_code == 200:
+                    existing = resp.json().get("fields", {})
+                    missing = {}
+                    type_mismatch = {}
+                    for k, v in fields.items():
+                        if k not in existing:
+                            missing[k] = v
+                        elif existing[k].get("type") != v.get("type"):
+                            type_mismatch[k] = v
                     
-                    # 类不存在，创建并带上字段定义和 CLP
-                    logger.info(f"[Parse] 创建 Schema: {class_name}")
-                    create_resp = await client.post(
-                        f"{self.base_url}/schemas/{class_name}",
-                        headers=self.master_headers,
-                        json={
-                            "className": class_name,
-                            "fields": fields,
-                            "classLevelPermissions": self.DEFAULT_CLP,
-                        },
-                        timeout=10.0,
-                    )
-                    if create_resp.status_code in (200, 201):
-                        logger.info(f"[Parse] Schema 创建成功: {class_name}")
+                    # 先删除类型不匹配的字段，再重新添加
+                    if type_mismatch:
+                        logger.warning(f"[Parse] 字段类型不匹配 {class_name}: {list(type_mismatch.keys())}")
+                        delete_fields = {k: {"__op": "Delete"} for k in type_mismatch}
+                        del_resp = await client.put(
+                            f"{self.base_url}/schemas/{class_name}",
+                            json={"className": class_name, "fields": delete_fields},
+                        )
+                        if del_resp.status_code == 200:
+                            missing.update(type_mismatch)
+                            logger.info(f"[Parse] 旧字段已删除，将重建: {list(type_mismatch.keys())}")
+                        else:
+                            logger.error(f"[Parse] 删除字段失败: {class_name} - {del_resp.text}")
+                    
+                    # 添加缺少的字段（含类型修复后重建的）
+                    if missing:
+                        logger.info(f"[Parse] 补充字段 {class_name}: {list(missing.keys())}")
+                        add_resp = await client.put(
+                            f"{self.base_url}/schemas/{class_name}",
+                            json={"className": class_name, "fields": missing},
+                        )
+                        if add_resp.status_code == 200:
+                            logger.info(f"[Parse] 字段补充成功: {class_name}")
+                        else:
+                            logger.error(f"[Parse] 字段补充失败: {class_name} - {add_resp.text}")
                     else:
-                        logger.error(f"[Parse] Schema 创建失败: {class_name} - {create_resp.text}")
-                except Exception as e:
-                    logger.error(f"[Parse] ensure_schema 异常({class_name}): {e}")
+                        logger.debug(f"[Parse] Schema OK: {class_name}")
+                    
+                    # 确保 CLP 正确
+                    await self._ensure_clp(client, class_name)
+                    continue
+                
+                # 类不存在，创建并带上字段定义和 CLP
+                logger.info(f"[Parse] 创建 Schema: {class_name}")
+                create_resp = await client.post(
+                    f"{self.base_url}/schemas/{class_name}",
+                    json={
+                        "className": class_name,
+                        "fields": fields,
+                        "classLevelPermissions": self.DEFAULT_CLP,
+                    },
+                )
+                if create_resp.status_code in (200, 201):
+                    logger.info(f"[Parse] Schema 创建成功: {class_name}")
+                else:
+                    logger.error(f"[Parse] Schema 创建失败: {class_name} - {create_resp.text}")
+            except Exception as e:
+                logger.error(f"[Parse] ensure_schema 异常({class_name}): {e}")
     
     async def _ensure_clp(self, client, class_name: str):
         """确保指定类的 CLP 允许客户端访问"""
         try:
             resp = await client.put(
                 f"{self.base_url}/schemas/{class_name}",
-                headers=self.master_headers,
                 json={"className": class_name, "classLevelPermissions": self.DEFAULT_CLP},
-                timeout=10.0,
             )
             if resp.status_code == 200:
                 logger.debug(f"[Parse] CLP 已更新: {class_name}")
@@ -608,6 +788,45 @@ class ParseClient:
             "__op": "RemoveRelation",
             "objects": objects
         }
+
+    async def ensure_default_users(self):
+        """确保默认管理员和运营用户存在"""
+        default_users = [
+            {"username": "admin", "password": "Admin@123456", "email": "admin@aigccloud.com", "role": "admin", "level": 99, "emailVerified": True},
+            {"username": "operator", "password": "Operator@123456", "email": "operator@aigccloud.com", "role": "admin", "level": 50, "emailVerified": True},
+        ]
+        client = await self._get_master_client()
+        for user_data in default_users:
+            try:
+                # 检查用户是否已存在
+                resp = await client.get(
+                    f"{self.base_url}/users",
+                    params={"where": f'{{"username":"{user_data["username"]}"}}', "limit": "1"},
+                )
+                results = resp.json().get("results", [])
+                if results:
+                    # 已存在，确保 role 正确
+                    existing = results[0]
+                    if existing.get("role") != user_data["role"]:
+                        await client.put(
+                            f"{self.base_url}/users/{existing['objectId']}",
+                            json={"role": user_data["role"], "level": user_data["level"]},
+                        )
+                        logger.info(f"[Parse] 更新用户角色: {user_data['username']} -> {user_data['role']}")
+                    else:
+                        logger.debug(f"[Parse] 默认用户已存在: {user_data['username']}")
+                else:
+                    # 创建用户
+                    create_resp = await client.post(
+                        f"{self.base_url}/users",
+                        json=user_data,
+                    )
+                    if create_resp.status_code in (200, 201):
+                        logger.info(f"[Parse] 创建默认用户成功: {user_data['username']} (role={user_data['role']})")
+                    else:
+                        logger.error(f"[Parse] 创建用户失败: {user_data['username']} - {create_resp.text}")
+            except Exception as e:
+                logger.error(f"[Parse] 创建默认用户异常({user_data['username']}): {e}")
 
 
 # 全局单例

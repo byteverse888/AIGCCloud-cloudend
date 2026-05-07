@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from enum import Enum
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.core.parse_client import parse_client
 from app.core.web3_client import web3_client
@@ -361,7 +361,7 @@ async def verify_web3_transfer(request: VerifyTransferRequest):
         await parse_client.update_object("Order", request.order_id, {
             "txHash": request.tx_hash,
             "status": "paid",
-            "paidAt": datetime.now().isoformat()
+            "paidAt": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"[验证转账] 交易待确认，订单更新为支付中，开始轮询: {request.order_id}")
         
@@ -432,7 +432,7 @@ async def verify_web3_transfer(request: VerifyTransferRequest):
         await parse_client.update_object("Order", request.order_id, {
             "txHash": request.tx_hash,
             "status": "completed",
-            "completedAt": datetime.now().isoformat()
+            "completedAt": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"[验证转账] 订单已完成: {request.order_id}, txHash: {request.tx_hash[:16]}...")
         
@@ -495,13 +495,13 @@ async def mock_pay_order(order_id: str):
     product_id = order.get("productId")
     buyer_address = order.get("buyerAddress")
     amount = order.get("amount", 0)
-    mock_tx_hash = f"mock_tx_{order_id}_{datetime.now().timestamp()}"
+    mock_tx_hash = f"mock_tx_{order_id}_{datetime.now(timezone.utc).timestamp()}"
     
     # 更新订单状态
     await parse_client.update_object("Order", order_id, {
         "txHash": mock_tx_hash,
         "status": "completed",
-        "completedAt": datetime.now().isoformat()
+        "completedAt": datetime.now(timezone.utc).isoformat()
     })
     
     # 更新商品owner
@@ -592,7 +592,7 @@ async def process_pending_paid_orders():
                     
                     await parse_client.update_object("Order", order_id, {
                         "status": "completed",
-                        "completedAt": datetime.now().isoformat()
+                        "completedAt": datetime.now(timezone.utc).isoformat()
                     })
                     logger.info(f"[后台任务] 订单已完成: {order_id}")
                 

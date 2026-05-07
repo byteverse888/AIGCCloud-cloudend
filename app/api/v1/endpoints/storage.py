@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 import boto3
 from botocore.config import Config
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from app.core.config import settings
@@ -77,7 +77,7 @@ async def get_presigned_upload_url(
         
         # 生成唯一文件key
         ext = request.filename.split('.')[-1] if '.' in request.filename else ''
-        timestamp = datetime.now().strftime('%Y%m%d')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
         unique_id = str(uuid.uuid4())[:8]
         file_key = f"{request.prefix}/{user_id}/{timestamp}/{unique_id}.{ext}" if ext else f"{request.prefix}/{user_id}/{timestamp}/{unique_id}"
         
@@ -146,7 +146,7 @@ async def get_batch_presigned_upload_urls(
     """
     try:
         s3 = get_s3_client()
-        timestamp = datetime.now().strftime('%Y%m%d')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
         expires_in = 3600
         
         results = []

@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 import uuid
 import boto3
@@ -80,7 +80,7 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
         # 更新状态为处理中
         await parse_client.update_object("AITask", task_id, {
             "status": TaskStatus.PROCESSING,
-            "updatedAt": datetime.now().isoformat()
+            "updatedAt": datetime.now(timezone.utc).isoformat()
         })
         
         # TODO: 根据任务类型调用不同的AI服务
@@ -98,7 +98,7 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
                 "url": result_url,
                 "thumbnail": result_url,
             }],
-            "updatedAt": datetime.now().isoformat()
+            "updatedAt": datetime.now(timezone.utc).isoformat()
         })
         
     except Exception as e:
@@ -106,7 +106,7 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
         await parse_client.update_object("AITask", task_id, {
             "status": TaskStatus.FAILED,
             "errorMessage": str(e),
-            "updatedAt": datetime.now().isoformat()
+            "updatedAt": datetime.now(timezone.utc).isoformat()
         })
 
 
@@ -184,7 +184,7 @@ async def submit_task(
         type=request.type,
         model=request.model,
         status=TaskStatus.PENDING,
-        created_at=datetime.now(),
+        created_at=datetime.now(timezone.utc),
     )
 
 
@@ -285,7 +285,7 @@ async def update_task_status(
     
     update_data = {
         "status": request.status,
-        "updatedAt": datetime.now().isoformat()
+        "updatedAt": datetime.now(timezone.utc).isoformat()
     }
     
     if request.results:
@@ -487,7 +487,7 @@ async def upload_to_rustfs(content: bytes, filename: str, content_type: str) -> 
         s3 = get_s3_client()
         
         # 生成唯一文件key
-        timestamp = datetime.now().strftime('%Y%m%d')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d')
         unique_id = str(uuid.uuid4())[:8]
         ext = filename.split('.')[-1] if '.' in filename else 'bin'
         file_key = f"tasks/{timestamp}/{unique_id}.{ext}"
@@ -618,8 +618,8 @@ async def complete_task(request: CompleteTaskRequest):
         "status": TaskStatus.COMPLETED,
         "executor": request.executor,
         "results": verified_results,
-        "completedAt": datetime.now().isoformat(),
-        "updatedAt": datetime.now().isoformat()
+        "completedAt": datetime.now(timezone.utc).isoformat(),
+        "updatedAt": datetime.now(timezone.utc).isoformat()
     }
     await parse_client.update_object("AITask", task_object_id, update_data)
     logger.info(f"[任务完成] 任务状态已更新: {request.task_id}")
@@ -718,8 +718,8 @@ async def claim_task(task_id: str, executor: str):
     await parse_client.update_object("AITask", task["objectId"], {
         "status": TaskStatus.PROCESSING,
         "executor": executor,
-        "claimedAt": datetime.now().isoformat(),
-        "updatedAt": datetime.now().isoformat()
+        "claimedAt": datetime.now(timezone.utc).isoformat(),
+        "updatedAt": datetime.now(timezone.utc).isoformat()
     })
     
     return {

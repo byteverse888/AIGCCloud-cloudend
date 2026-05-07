@@ -3,7 +3,7 @@
 """
 import secrets
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -46,14 +46,14 @@ def generate_sms_code(length: int = 6) -> str:
 
 def generate_order_no(prefix: str = "ORD") -> str:
     """生成订单号"""
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     random_suffix = secrets.token_hex(4).upper()
     return f"{prefix}{timestamp}{random_suffix}"
 
 
 def generate_task_id() -> str:
     """生成任务ID"""
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     random_suffix = secrets.token_hex(6)
     return f"task_{timestamp}_{random_suffix}"
 
@@ -66,7 +66,7 @@ def create_access_token(
 ) -> str:
     """创建访问Token"""
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.jwt_access_token_expire_minutes))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=settings.jwt_access_token_expire_minutes))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
@@ -92,36 +92,16 @@ def verify_jwt_token(token: str) -> Optional[str]:
 
 def is_valid_ethereum_address(address: str) -> bool:
     """验证以太坊地址格式"""
-    if not address or not address.startswith("0x"):
-        return False
-    if len(address) != 42:
-        return False
-    try:
-        int(address, 16)
-        return True
-    except ValueError:
-        return False
+    from web3 import Web3
+    return Web3.is_address(address) if address else False
 
 
 def checksum_address(address: str) -> str:
-    """转换为校验和地址格式"""
+    """转换为 EIP-55 校验和地址格式（使用 Web3 标准实现）"""
+    from web3 import Web3
     if not is_valid_ethereum_address(address):
         return address
-    
-    address = address.lower()[2:]
-    hash_hex = hashlib.sha3_256(address.encode()).hexdigest()
-    
-    result = "0x"
-    for i, char in enumerate(address):
-        if char.isalpha():
-            if int(hash_hex[i], 16) >= 8:
-                result += char.upper()
-            else:
-                result += char
-        else:
-            result += char
-    
-    return result
+    return Web3.to_checksum_address(address)
 
 
 # ============ 签名验证 ============

@@ -1,11 +1,12 @@
 """
 商品管理端点 - 审核、举报等
 """
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, List
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.core.parse_client import parse_client
 from app.core.email_client import email_client
@@ -82,7 +83,7 @@ async def review_product(
     # 更新商品状态
     update_data = {
         "status": request.status,
-        "reviewedAt": datetime.now().isoformat(),
+        "reviewedAt": datetime.now(timezone.utc).isoformat(),
         "reviewedBy": admin_id,
     }
     if request.review_note:
@@ -126,21 +127,22 @@ async def batch_review_products(
     admin_id: str = Depends(get_admin_user_id)
 ):
     """
-    批量审核商品(管理员)
+    批量审核商品(管理员) - 并发执行
     """
-    results = []
-    for product_id in request.product_ids:
+    async def _review_one(product_id: str) -> dict:
         try:
             await parse_client.update_object("Product", product_id, {
                 "status": request.status,
-                "reviewedAt": datetime.now().isoformat(),
+                "reviewedAt": datetime.now(timezone.utc).isoformat(),
                 "reviewedBy": admin_id,
                 "reviewNote": request.review_note,
             })
-            results.append({"product_id": product_id, "success": True})
+            return {"product_id": product_id, "success": True}
         except Exception as e:
-            results.append({"product_id": product_id, "success": False, "error": str(e)})
-    
+            return {"product_id": product_id, "success": False, "error": str(e)}
+
+    results = await asyncio.gather(*[_review_one(pid) for pid in request.product_ids])
+
     return {
         "success": True,
         "results": results,
@@ -323,7 +325,7 @@ async def process_report(
     # 更新举报状态
     await parse_client.update_object("ProductReport", report_id, {
         "status": status,
-        "processedAt": datetime.now().isoformat(),
+        "processedAt": datetime.now(timezone.utc).isoformat(),
         "processedBy": admin_id,
         "processNote": note,
     })

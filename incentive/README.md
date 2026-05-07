@@ -106,6 +106,7 @@ python -m incentive history 0x1234abcd... --limit 50
 ### Cron 配置
 
 ```cron
+# debug 阶段
 # 每10分钟采集节点数据并计算积分
 */10 * * * *  cd /home/ubuntu/AIGC/aigccloud-cloudend && incentive/.venv/bin/python -m incentive collect
 
