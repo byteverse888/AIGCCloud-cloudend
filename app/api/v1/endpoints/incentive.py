@@ -10,7 +10,7 @@ from app.core.parse_client import parse_client
 from app.core.redis_client import redis_client
 from app.core.web3_client import web3_client
 from app.core.deps import get_current_user_id
-from app.core.incentive_service import incentive_service, IncentiveType, INCENTIVE_CONFIG
+from app.core.incentive_service import incentive_service
 from app.core.logger import logger
 
 router = APIRouter()
@@ -18,29 +18,11 @@ router = APIRouter()
 
 # ============ 模型 ============
 
-class GrantIncentiveRequest(BaseModel):
-    user_id: str
-    type: str  # IncentiveType 字符串
+class ExchangeRequest(BaseModel):
     amount: float
-    description: str
 
 
 # ============ 端点 ============
-
-@router.post("/settle")
-async def trigger_settle():
-    """
-    手动触发清算待结算激励积分（管理接口）
-    直接执行清算逻辑，不经过ARQ队列
-    """
-    from app.tasks.arq_tasks import settle_pending_incentives
-    try:
-        result = await settle_pending_incentives({})
-        return {"success": True, "result": result}
-    except Exception as e:
-        logger.error(f"[手动清算] 失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/history")
 async def get_incentive_history(
@@ -48,42 +30,44 @@ async def get_incentive_history(
     limit: int = 20,
     type: Optional[str] = None,
     exclude_type: Optional[str] = None,
-    settlement_status: Optional[str] = None,
+    category: Optional[str] = None,
     user_id: str = Depends(get_current_user_id)
 ):
     """
-    获取用户激励历史
-    返回精简字段：type、amount、description、status、settlementStatus、created_at
-    可选过滤: settlement_status (pending/settled), exclude_type (排除指定类型如settlement)
+    获取用户账户积分流水（AccountRecord 统一账本）
+    返回字段：type、category、amount、balance_after、description、created_at
+    可选过滤：type (recharge/purchase/refund/reward/exchange/consume)、category、exclude_type
     """
-    where = {"userId": user_id}
+    where = {"userId": user_id, "status": "success"}
     if type:
         where["type"] = type
     if exclude_type:
         where["type"] = {"$nin": exclude_type.split(",")}
-    if settlement_status:
-        where["settlementStatus"] = settlement_status
+    if category:
+        where["category"] = category
     
     skip = (page - 1) * limit
     result = await parse_client.query_objects(
-        "IncentiveLog",
+        "AccountRecord",
         where=where,
         order="-createdAt",
         limit=limit,
         skip=skip
     )
     
-    total = await parse_client.count_objects("IncentiveLog", where)
+    total = await parse_client.count_objects("AccountRecord", where)
     
     records = []
     for item in result.get("results", []):
         records.append({
             "id": item["objectId"],
             "type": item.get("type", ""),
+            "category": item.get("category", ""),
             "amount": item.get("amount", 0),
+            "balance_after": item.get("balance_after", 0),
             "description": item.get("description", ""),
-            "status": item.get("status", ""),
-            "settlementStatus": item.get("settlementStatus", "pending"),
+            "relatedId": item.get("relatedId", ""),
+            "relatedOrderNo": item.get("relatedOrderNo", ""),
             "created_at": item.get("createdAt", ""),
         })
     
@@ -98,29 +82,34 @@ async def get_incentive_history(
 @router.get("/balance")
 async def get_balance(user_id: str = Depends(get_current_user_id)):
     """
-    获取用户金币余额
-    返回：链上余额 + 待结算积分
+    获取用户余额
+    - 账户积分（totalIncentive）始终返回
+    - 链上金币：仅在用户绑定了 web3Address 时查询并返回
     """
     try:
         user = await parse_client.get_user(user_id)
         web3_address = user.get("web3Address")
-        
-        # 链上余额
-        coins = 0
-        if web3_address:
+        balance = incentive_service._read_balance(user)
+
+        # 未绑定钱包 → 不返回链上相关字段
+        if not web3_address:
+            return {
+                "balance": balance,
+                "coins": None,
+                "web3_address": None,
+                "member_level": user.get("memberLevel", "normal"),
+            }
+
+        # 已绑定 → 查询链上余额
+        try:
             coins = await web3_client.get_balance(web3_address)
-        
-        # 待结算积分（从 IncentiveLog 实时计算，避免计数器不一致）
-        pending_result = await parse_client.query_objects(
-            "IncentiveLog",
-            where={"userId": user_id, "settlementStatus": "pending"},
-            limit=1000
-        )
-        pending_coins = sum(item.get("amount", 0) for item in pending_result.get("results", []))
-        
+        except Exception as e:
+            logger.warning(f"[余额] 查询链上余额失败: {e}")
+            coins = 0
+
         return {
+            "balance": balance,
             "coins": coins,
-            "pending_coins": pending_coins,
             "web3_address": web3_address,
             "member_level": user.get("memberLevel", "normal"),
         }
@@ -128,10 +117,98 @@ async def get_balance(user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=404, detail="用户不存在")
 
 
+@router.get("/account-balance")
+async def get_account_balance(user_id: str = Depends(get_current_user_id)):
+    """获取用户当前账户积分余额（totalIncentive）"""
+    try:
+        user = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    balance = incentive_service._read_balance(user)
+    return {"balance": balance, "user_id": user_id}
+
+
+# ============ 每日签到 ============
+
+@router.post("/daily-sign")
+async def daily_sign(user_id: str = Depends(get_current_user_id)):
+    """每日签到，发放账户积分（日级幂等）"""
+    result = await incentive_service.grant_daily_sign_reward(user_id)
+    if not result.get("success"):
+        if result.get("signed"):
+            return {"success": False, "signed": True, "message": result.get("error", "今日已签到")}
+        raise HTTPException(status_code=400, detail=result.get("error", "签到失败"))
+    return result
+
+
+@router.get("/daily-sign/status")
+async def daily_sign_status(user_id: str = Depends(get_current_user_id)):
+    """查询今日是否已签到 + 连续签到天数"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        r = await parse_client.query_objects(
+            "DailySign",
+            where={"userId": user_id, "signDate": today},
+            limit=1,
+        )
+        items = r.get("results", [])
+        signed = bool(items)
+        continuous = int(items[0].get("continuousDays", 0)) if signed else 0
+        if not signed:
+            # 查昨天的连续天数预览
+            from datetime import timedelta
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            y = await parse_client.query_objects(
+                "DailySign", where={"userId": user_id, "signDate": yesterday}, limit=1
+            )
+            if y.get("results"):
+                continuous = int(y["results"][0].get("continuousDays", 0))
+        return {"signed": signed, "continuousDays": continuous, "date": today}
+    except Exception as e:
+        logger.warning(f"[签到状态] 查询失败: {e}")
+        return {"signed": False, "continuousDays": 0, "date": today}
+
+
+# ============ 积分兑换 ============
+
+@router.get("/exchange-rate")
+async def get_exchange_rate():
+    """当前兑换比例：{points} 账户积分 = {coins} 链上金币"""
+    points, coins = await incentive_service._get_exchange_rate()
+    return {"points": points, "coins": coins}
+
+
+@router.post("/exchange-to-web3")
+async def exchange_to_web3(
+    request: ExchangeRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """账户积分 → 链上金币"""
+    result = await incentive_service.exchange_to_web3(user_id, float(request.amount))
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "兑换失败"))
+    return result
+
+
+@router.post("/exchange-to-balance")
+async def exchange_to_balance(
+    request: ExchangeRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """链上金币 → 账户积分"""
+    result = await incentive_service.exchange_to_balance(user_id, float(request.amount))
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "兑换失败"))
+    return result
+
+
 @router.get("/stats")
 async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
     """
-    获取激励统计
+    获取账户积分统计
+    - coins / web3_address：链上余额
+    - total_earned：累计所获得的账户积分（AccountRecord.amount > 0 累加）
+    - by_type：各类型流水计数
     """
     try:
         user = await parse_client.get_user(user_id)
@@ -144,129 +221,29 @@ async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
     if web3_address:
         coins = await web3_client.get_balance(web3_address)
     
-    # 待结算积分（从 IncentiveLog 实时计算）
-    pending_result = await parse_client.query_objects(
-        "IncentiveLog",
-        where={"userId": user_id, "settlementStatus": "pending"},
-        limit=1000
-    )
-    pending_coins = sum(item.get("amount", 0) for item in pending_result.get("results", []))
-    
-    # 统计各类型奖励
+    # 按 type 统计流水计数（AccountRecord）
+    account_types = ["recharge", "purchase", "refund", "reward", "exchange", "consume"]
     stats = {}
-    for itype in IncentiveType:
-        count = await parse_client.count_objects("IncentiveLog", {
+    for t in account_types:
+        count = await parse_client.count_objects("AccountRecord", {
             "userId": user_id,
-            "type": itype.value
+            "type": t,
+            "status": "success",
         })
-        stats[itype.value] = count
+        stats[t] = count
     
-    # 计算总获得金币
-    result = await parse_client.query_objects(
-        "IncentiveLog",
-        where={"userId": user_id, "amount": {"$gt": 0}},
-        limit=1000
+    # 累计所获得的账户积分（所有正值）
+    earned_result = await parse_client.query_objects(
+        "AccountRecord",
+        where={"userId": user_id, "status": "success", "amount": {"$gt": 0}},
+        limit=1000,
     )
-    total_earned = sum(item.get("amount", 0) for item in result.get("results", []))
+    total_earned = sum(item.get("amount", 0) for item in earned_result.get("results", []))
     
     return {
+        "balance": incentive_service._read_balance(user),
         "coins": coins,
-        "pending_coins": pending_coins,
         "web3_address": web3_address,
         "total_earned": total_earned,
         "by_type": stats,
-    }
-
-
-@router.post("/grant")
-async def grant_incentive(request: GrantIncentiveRequest):
-    """
-    发放激励(内部接口) - 通过Web3接口铸造金币到联盟链
-    """
-    try:
-        user = await parse_client.get_user(request.user_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    
-    web3_address = user.get("web3Address")
-    if not web3_address:
-        raise HTTPException(status_code=400, detail="用户未绑定Web3地址")
-    
-    # 通过Web3接口铸造金币
-    mint_result = await web3_client.mint(web3_address, int(request.amount))
-    if not mint_result.get("success"):
-        raise HTTPException(status_code=500, detail="发放奖励失败: " + mint_result.get("error", ""))
-    
-    # 记录激励日志
-    await parse_client.create_object("IncentiveLog", {
-        "userId": request.user_id,
-        "web3Address": web3_address,
-        "type": request.type,
-        "amount": request.amount,
-        "txHash": mint_result.get("tx_hash"),
-        "description": request.description,
-        "status": "success",
-        "settlementStatus": "settled",
-    })
-    
-    # 获取新余额
-    new_balance = await web3_client.get_balance(web3_address)
-    
-    return {
-        "success": True,
-        "user_id": request.user_id,
-        "amount": request.amount,
-        "tx_hash": mint_result.get("tx_hash"),
-        "new_coins": new_balance
-    }
-
-
-@router.post("/consume")
-async def consume_coins(
-    amount: float,
-    description: str = "金币消费",
-    user_id: str = Depends(get_current_user_id)
-):
-    """
-    消费金币 - 通过Web3接口销毁金币
-    """
-    try:
-        user = await parse_client.get_user(user_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    
-    web3_address = user.get("web3Address")
-    if not web3_address:
-        raise HTTPException(status_code=400, detail="用户未绑定Web3地址")
-    
-    # 检查联盟链上的余额
-    balance = await web3_client.get_balance(web3_address)
-    if balance < amount:
-        raise HTTPException(status_code=400, detail="余额不足")
-    
-    # 通过Web3接口销毁金币
-    burn_result = await web3_client.burn(web3_address, int(amount))
-    if not burn_result.get("success"):
-        raise HTTPException(status_code=500, detail="消费失败: " + burn_result.get("error", ""))
-    
-    # 记录消费日志
-    await parse_client.create_object("IncentiveLog", {
-        "userId": user_id,
-        "web3Address": web3_address,
-        "type": "consume",
-        "amount": -amount,
-        "txHash": burn_result.get("tx_hash"),
-        "description": description,
-        "status": "success",
-        "settlementStatus": "settled",
-    })
-    
-    # 获取新余额
-    new_balance = await web3_client.get_balance(web3_address)
-    
-    return {
-        "success": True,
-        "consumed": amount,
-        "tx_hash": burn_result.get("tx_hash"),
-        "new_coins": new_balance
     }

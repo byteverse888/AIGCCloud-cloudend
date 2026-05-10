@@ -273,7 +273,6 @@ async def login(request: LoginRequest, http_request: Request):
             "level": user_data.get("level", 1),
             "memberLevel": user_data.get("memberLevel", "normal"),
             "memberExpireAt": user_data.get("memberExpireAt"),
-            "coins": user_data.get("coins", 0),  # 金币余额
             "avatar": user_data.get("avatar"),
             "avatarKey": user_data.get("avatarKey"),
             "web3Address": user_data.get("web3Address"),
@@ -417,7 +416,6 @@ async def phone_login(request: PhoneLoginRequest):
         "role": user_data.get("role", "user"),
         "level": user_data.get("level", 1),
         "memberLevel": user_data.get("memberLevel", "normal"),
-        "coins": user_data.get("coins", 0),
         "avatar": user_data.get("avatar"),
         "avatarKey": user_data.get("avatarKey"),
         "web3Address": user_data.get("web3Address"),
@@ -543,7 +541,6 @@ async def email_activate(token: str):
             "password": password,
             "role": "user",
             "level": 1,
-            "coins": 100,  # 新用户赠送 100 金币
             "memberLevel": "normal",
         })
         
@@ -564,6 +561,17 @@ async def email_activate(token: str):
         
         # 删除 Token
         await redis_client.delete_activation_token(token)
+        
+        # 发放注册激励奖励（账户积分，幂等）
+        try:
+            from app.core.incentive_service import incentive_service
+            reward_result = await incentive_service.grant_register_reward(user_id)
+            if reward_result.get("success"):
+                logger.info(f"[Auth] 注册激励发放成功: {user_id}")
+            else:
+                logger.warning(f"[Auth] 注册激励发放失败: {reward_result.get('error')}")
+        except Exception as e:
+            logger.error(f"[Auth] 注册激励发放异常: {e}")
         
         # 返回 JSON 响应（前端激活页面会调用此接口）
         return {
@@ -689,7 +697,6 @@ async def get_current_user(token: str = Depends(verify_jwt_token)):
                 "role": user.get("role", "user"),
                 "level": user.get("level", 1),
                 "memberLevel": user.get("memberLevel", "normal"),
-                "coins": user.get("coins", 0),
                 "avatar": user.get("avatar"),
                 "avatarKey": user.get("avatarKey"),
                 "web3Address": user.get("web3Address"),
@@ -901,7 +908,6 @@ def _build_user_response(user_data: dict, session_token: str, address: str):
         "level": user_data.get("level", 1),
         "memberLevel": user_data.get("memberLevel", "normal"),
         "memberExpireAt": user_data.get("memberExpireAt"),
-        "coins": user_data.get("coins", 0),
         "avatar": user_data.get("avatar"),
         "avatarKey": user_data.get("avatarKey"),
         "web3Address": web3_address,
@@ -947,7 +953,6 @@ async def web3_register(request: Web3LoginRequest):
             "web3Address": address,
             "role": "user",
             "level": 1,
-            "coins": 100,  # 新用户赠送 100 金币
             "memberLevel": "normal",
         })
         

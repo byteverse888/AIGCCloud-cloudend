@@ -131,7 +131,6 @@ async def submit_task(
     # 2. 检查用户余额或会员状态
     member_level = user.get("memberLevel", "normal")
     is_vip = member_level in ("vip", "svip")
-    balance = user.get("totalIncentive", 0)
     
     # 任务消耗配置
     task_costs = {
@@ -145,17 +144,22 @@ async def submit_task(
     
     cost = task_costs.get(request.type, 10)
     
-    # 付费用户免费，普通用户扣费
-    if not is_vip:
-        if balance < cost:
-            raise HTTPException(status_code=400, detail=f"余额不足，需要 {cost} 金币")
-        # 扣除金币
-        await parse_client.update_user(user_id, {
-            "totalIncentive": parse_client.increment(-cost)
-        })
-    
-    # 3. 生成任务ID
+    # 3. 生成任务ID（需要先拿 task_id 作为账本关联）
     task_id = generate_task_id()
+    
+    # 付费用户免费，普通用户扣费（走统一账本 adjust_user_balance）
+    if not is_vip and cost > 0:
+        deduct_result = await incentive_service.adjust_user_balance(
+            user_id=user_id,
+            delta=-float(cost),
+            type_="consume",
+            category="task_cost",
+            description=f"提交 {request.type} 任务扣费",
+            related_id=f"task_cost_{task_id}",
+            check_idempotent=False,
+        )
+        if not deduct_result.get("success"):
+            raise HTTPException(status_code=400, detail=deduct_result.get("error") or f"余额不足，需要 {cost} 金币")
     
     # 4. 创建任务记录
     task_data = {
@@ -167,6 +171,7 @@ async def submit_task(
         "data": request.data,
         "status": TaskStatus.PENDING,
         "cost": cost if not is_vip else 0,
+        "retryCount": 0,
     }
     
     result = await parse_client.create_object("AITask", task_data)
@@ -443,12 +448,21 @@ async def cancel_task(task_id: str, user_id: str = Depends(get_current_user_id))
     if task.get("status") != TaskStatus.PENDING:
         raise HTTPException(status_code=400, detail="只有排队中的任务可以取消")
     
-    # 退还金币
+    # 退还金币（走统一账本，idempotent by task_id）
     cost = task.get("cost", 0)
     if cost > 0:
-        await parse_client.update_user(user_id, {
-            "totalIncentive": parse_client.increment(cost)
-        })
+        refund_result = await incentive_service.adjust_user_balance(
+            user_id=user_id,
+            delta=float(cost),
+            type_="refund",
+            category="task_refund",
+            description=f"取消 {task.get('type', '')} 任务退费",
+            related_id=f"task_refund_{task_id}",
+            check_idempotent=True,
+        )
+        if not refund_result.get("success"):
+            logger.error(f"[任务取消] 退费失败 task_id={task_id}: {refund_result.get('error')}")
+            raise HTTPException(status_code=500, detail=f"退费失败: {refund_result.get('error', '')}")
     
     # 删除任务
     await parse_client.delete_object("AITask", task["objectId"])
@@ -461,7 +475,11 @@ async def cancel_task(task_id: str, user_id: str = Depends(get_current_user_id))
 
 
 @router.post("/{task_id}/retry")
-async def retry_task(task_id: str, user_id: str = Depends(get_current_user_id)):
+async def retry_task(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     重试失败任务
     - 仅失败状态(3)可重试
@@ -493,15 +511,18 @@ async def retry_task(task_id: str, user_id: str = Depends(get_current_user_id)):
     # 获取原任务成本
     cost = task.get("cost", 0)
     if cost > 0:
-        # 扣除金币
-        user = await parse_client.get_user(user_id)
-        balance = user.get("totalIncentive", 0)
-        if balance < cost:
-            raise HTTPException(status_code=400, detail=f"金币不足，需要{cost}金币")
-        
-        await parse_client.update_user(user_id, {
-            "totalIncentive": parse_client.increment(-cost)
-        })
+        # 走统一账本扣费（每次重试独立 relatedId）
+        deduct_result = await incentive_service.adjust_user_balance(
+            user_id=user_id,
+            delta=-float(cost),
+            type_="consume",
+            category="task_retry_cost",
+            description=f"重试 {task.get('type', '')} 任务扣费（第{retry_count + 1}次）",
+            related_id=f"task_retry_{task_id}_{retry_count + 1}",
+            check_idempotent=False,
+        )
+        if not deduct_result.get("success"):
+            raise HTTPException(status_code=400, detail=deduct_result.get("error") or f"金币不足，需要 {cost} 金币")
     
     # 重置任务状态
     await parse_client.update_object("AITask", task_object_id, {
@@ -513,10 +534,10 @@ async def retry_task(task_id: str, user_id: str = Depends(get_current_user_id)):
     # 重新添加到处理队列
     background_tasks.add_task(
         process_ai_task,
-        task_id=task_id,
-        task_type=task.get("type"),
-        model=task.get("model"),
-        data=task.get("data"),
+        task_object_id,
+        task.get("type"),
+        task.get("model"),
+        task.get("data") or {},
     )
     
     logger.info(f"[任务重试] task_id={task_id}, retry={retry_count + 1}")
@@ -787,9 +808,9 @@ async def complete_task(request: CompleteTaskRequest):
     await parse_client.update_object("AITask", task_object_id, update_data)
     logger.info(f"[任务完成] 任务状态已更新: {request.task_id}")
     
-    # 4. 发放激励给执行者
+    # 4. 发放激励给执行者（账户积分）
     reward_amount = 1  # 默认任务奖励
-    reward_tx_hash = None
+    reward_granted = False
     
     # 获取执行者用户信息（通过Web3地址查找）
     executor_users = await parse_client.query_users(
@@ -800,7 +821,7 @@ async def complete_task(request: CompleteTaskRequest):
         executor_user = executor_users["results"][0]
         executor_user_id = executor_user["objectId"]
         
-        # 发放任务奖励
+        # 发放任务奖励（写入 totalIncentive + AccountRecord）
         reward_result = await incentive_service.grant_task_reward(
             user_id=executor_user_id,
             task_id=request.task_id,
@@ -809,14 +830,13 @@ async def complete_task(request: CompleteTaskRequest):
         )
         
         if reward_result.get("success"):
-            reward_tx_hash = reward_result.get("tx_hash")
+            reward_granted = True
             # 更新任务状态为已发放奖励
             await parse_client.update_object("AITask", task_object_id, {
                 "status": TaskStatus.REWARDED,
                 "rewardAmount": reward_amount,
-                "rewardTxHash": reward_tx_hash
             })
-            logger.info(f"[任务完成] 激励已发放: {reward_amount} 金币, txHash: {reward_tx_hash}")
+            logger.info(f"[任务完成] 激励已发放: {reward_amount} 积分 → {executor_user_id}")
         else:
             logger.warning(f"[任务完成] 激励发放失败: {reward_result.get('error')}")
     else:
@@ -824,11 +844,11 @@ async def complete_task(request: CompleteTaskRequest):
     
     return TaskCompleteResponse(
         success=True,
-        message="任务完成，奖励已发放" if reward_tx_hash else "任务完成",
+        message="任务完成，奖励已发放" if reward_granted else "任务完成",
         task_id=request.task_id,
-        status=TaskStatus.REWARDED if reward_tx_hash else TaskStatus.COMPLETED,
-        reward_amount=reward_amount if reward_tx_hash else None,
-        reward_tx_hash=reward_tx_hash
+        status=TaskStatus.REWARDED if reward_granted else TaskStatus.COMPLETED,
+        reward_amount=reward_amount if reward_granted else None,
+        reward_tx_hash=None
     )
 
 

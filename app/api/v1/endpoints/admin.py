@@ -11,6 +11,7 @@ from typing import List
 
 from app.core.deps import get_admin_user_id, get_operator_user_id
 from app.core.parse_client import parse_client
+from app.core.incentive_service import incentive_service
 from app.core.logger import logger
 
 router = APIRouter()
@@ -873,10 +874,10 @@ async def list_user_balances(
         raise HTTPException(status_code=500, detail="查询用户余额列表失败")
 
     items = []
-    total_coins = 0.0
+    total_balance = 0.0
     for u in result.get("results", []):
-        coins = float(u.get("coins", 0) or 0)
-        total_coins += coins
+        balance = incentive_service._read_balance(u)
+        total_balance += balance
         items.append({
             "userId": u.get("objectId"),
             "username": u.get("username", ""),
@@ -884,7 +885,7 @@ async def list_user_balances(
             "role": u.get("role", "user"),
             "level": u.get("level", 1),
             "memberLevel": u.get("memberLevel", "none"),
-            "coins": coins,
+            "balance": balance,
             "status": u.get("status", "active"),
             "createdAt": u.get("createdAt", ""),
         })
@@ -900,7 +901,7 @@ async def list_user_balances(
         "total": total_count,
         "page": page,
         "limit": limit,
-        "pageCoinsTotal": round(total_coins, 2),
+        "pageBalanceTotal": round(total_balance, 2),
     }
 
 

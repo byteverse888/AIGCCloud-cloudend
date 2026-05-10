@@ -13,6 +13,7 @@ from app.core.deps import get_current_user_id, get_operator_user_id
 from app.core.security import generate_order_no
 from app.core.logger import logger
 from app.core.operation_log import log_operation
+from app.core.incentive_service import incentive_service
 
 router = APIRouter()
 
@@ -382,44 +383,76 @@ async def purchase_asset_with_balance(
         raise HTTPException(status_code=400, detail="您已购买过该商品")
 
     price = float(asset.get("price", 0) or 0)
-
+    
     # 3. 余额校验（免费商品直接通过）
     try:
         buyer = await parse_client.get_user(user_id)
     except Exception:
         raise HTTPException(status_code=404, detail="用户不存在")
-    balance = float(buyer.get("totalIncentive", 0) or 0)
+    balance = incentive_service._read_balance(buyer)
     if price > 0 and balance < price:
         raise HTTPException(status_code=400, detail=f"积分余额不足，需要 {price:g} 积分，当前 {balance:g}")
-
-    # 4. 扣买家、增卖家
+    
+    # 4. 先创建订单（需要 orderNo 作为账本 relatedOrderNo）
+    order_no = generate_order_no()
+    
+    # 5. 扣买家（统一账本）
     if price > 0:
-        try:
-            await parse_client.update_user(user_id, {
-                "totalIncentive": parse_client.increment(-price)
-            })
-        except Exception as e:
-            logger.error(f"[积分支付] 扣减买家余额失败: {e}")
-            raise HTTPException(status_code=500, detail="扣减余额失败")
-        if creator_id:
-            try:
-                await parse_client.update_user(creator_id, {
-                    "totalIncentive": parse_client.increment(price)
-                })
-            except Exception as e:
-                # 卖家入账失败仅告警，不回滚买家扣费（如需昵蛋可后续补偷）
-                logger.warning(f"[积分支付] 卖家入账失败，需后续对账: buyer={user_id} seller={creator_id} price={price} err={e}")
+        buyer_result = await incentive_service.adjust_user_balance(
+            user_id=user_id,
+            delta=-float(price),
+            type_="purchase",
+            category="product_purchase",
+            description=f"购买商品: {asset.get('name', '')}",
+            related_id=f"purchase_{order_no}",
+            related_order_no=order_no,
+        )
+        if not buyer_result.get("success"):
+            raise HTTPException(status_code=500, detail=buyer_result.get("error", "扣减余额失败"))
 
-    # 5. 商品销售数 +1（失败不阻断）
+        # 6. 卖家入账（失败则回滚买家，整体交易失败）
+        if creator_id:
+            seller_result = await incentive_service.adjust_user_balance(
+                user_id=creator_id,
+                delta=float(price),
+                type_="reward",
+                category="product_income",
+                description=f"商品售卖收入: {asset.get('name', '')}",
+                related_id=f"income_{order_no}",
+                related_order_no=order_no,
+            )
+            if not seller_result.get("success"):
+                # 回滚买家扣款
+                logger.error(
+                    f"[积分支付] 卖家入账失败，回滚买家: buyer={user_id} seller={creator_id} price={price} err={seller_result.get('error')}"
+                )
+                try:
+                    await incentive_service.adjust_user_balance(
+                        user_id=user_id,
+                        delta=float(price),
+                        type_="refund",
+                        category="purchase_rollback",
+                        description=f"商品购买回滚（卖家入账失败）: {asset.get('name', '')}",
+                        related_id=f"purchase_rollback_{order_no}",
+                        related_order_no=order_no,
+                        check_idempotent=False,
+                    )
+                except Exception as _re:
+                    logger.error(f"[积分支付] 买家回滚异常: {_re}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"卖家入账失败，交易已回滚: {seller_result.get('error', '')}",
+                )
+    
+    # 7. 商品销售数 +1（失败不阻断）
     try:
         await parse_client.update_object("Product", asset_id, {
             "sales": parse_client.increment(1)
         })
     except Exception as e:
         logger.warning(f"[积分支付] 更新商品销量失败: {e}")
-
-    # 6. 创建 completed 订单
-    order_no = generate_order_no()
+    
+    # 8. 创建 completed 订单
     try:
         await parse_client.create_object("Order", {
             "orderNo": order_no,
@@ -435,9 +468,8 @@ async def purchase_asset_with_balance(
         })
     except Exception as e:
         logger.error(f"[积分支付] 创建订单失败: {e}")
-        raise HTTPException(status_code=500, detail="创建订单失败")
-
-    # 7. 同步从购物车移除（失败不阻断）
+    
+    # 9. 同步从购物车移除（失败不阻断）
     try:
         import json
         cart_key = f"cart:{user_id}"
@@ -456,7 +488,7 @@ async def purchase_asset_with_balance(
                 await redis_client.delete(cart_key)
     except Exception as e:
         logger.warning(f"[积分支付] 同步购物车失败（忽略）: {e}")
-
+    
     return {
         "success": True,
         "order_no": order_no,

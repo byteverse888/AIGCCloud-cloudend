@@ -27,6 +27,7 @@ from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_u
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.operation_log import log_operation
+from app.core.incentive_service import incentive_service
 
 router = APIRouter()
 
@@ -708,54 +709,22 @@ async def recharge_user_account(
     # operator 只能给普通用户充值
     if operator_user.get("role") != "admin" and target_user.get("role") != "user":
         raise HTTPException(status_code=403, detail="运营管理员仅可给普通用户充值")
-    
-    # 获取用户当前余额（_User.coins 字段才是真实余额，web3 链上余额仅作辅助）
-    current_balance = float(target_user.get("coins", 0) or 0)
-    new_balance = current_balance + float(request.amount)
 
-    # 先更新 _User.coins，确保用户余额真正增加（使用 Master Key）
-    try:
-        await parse_client.update_user_with_master_key(
-            request.user_id, {"coins": new_balance}
-        )
-    except Exception as e:
-        logger.error(f"[User] 更新用户余额失败: {e}", exc_info=True)
-        await log_operation(
-            operator_id=operator_id,
-            action="recharge",
-            module="users",
-            target_class="_User",
-            target_id=request.user_id,
-            target_name=target_user.get("username", ""),
-            description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 失败（更新余额异常）",
-            status="failed",
-            error_message=str(e),
-            detail={"amount": float(request.amount)},
-            request=http_request,
-            operator_name=operator_name,
-            operator_role=operator_user.get("role", ""),
-        )
-        raise HTTPException(status_code=500, detail=f"更新用户余额失败: {e}")
+    # 统一账本：更新 totalIncentive 并创建 AccountRecord
+    result = await incentive_service.adjust_user_balance(
+        user_id=request.user_id,
+        delta=float(request.amount),
+        type_="recharge",
+        category="admin_recharge",
+        description=f"管理员({operator_name})为用户 {target_user.get('username', '')} 充值 {request.amount} 积分",
+        related_id=f"admin_recharge_{operator_id}_{int(datetime.utcnow().timestamp() * 1000)}",
+        operator_id=operator_id,
+        operator_name=operator_name,
+        check_idempotent=False,
+    )
 
-    # 创建账户充值流水记录（createdAt 由 Parse Server 自动管理，不得手动传入）
-    record_data = {
-        "userId": request.user_id,
-        "username": target_user.get("username", ""),
-        "amount": float(request.amount),
-        "type": "recharge",
-        "category": "admin_recharge",
-        "balance_before": current_balance,
-        "balance_after": new_balance,
-        "balance": new_balance,
-        "description": f"管理员({operator_name})为用户 {target_user.get('username', '')} 充值 {request.amount} 金币",
-        "operator_id": operator_id,
-        "operator_name": operator_name,
-    }
-
-    try:
-        result = await parse_client.create_object("AccountRecord", record_data)
-    except Exception as e:
-        logger.error(f"[User] 创建充值记录失败: {e}", exc_info=True)
+    if not result.get("success"):
+        logger.error(f"[User] 充值失败: {result.get('error')}")
         await log_operation(
             operator_id=operator_id,
             action="recharge",
@@ -765,13 +734,16 @@ async def recharge_user_account(
             target_name=target_user.get("username", ""),
             description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 失败",
             status="failed",
-            error_message=str(e),
+            error_message=str(result.get("error", "")),
             detail={"amount": float(request.amount)},
             request=http_request,
             operator_name=operator_name,
             operator_role=operator_user.get("role", ""),
         )
-        raise HTTPException(status_code=500, detail=f"创建充值记录失败: {e}")
+        raise HTTPException(status_code=500, detail=str(result.get("error", "充值失败")))
+
+    current_balance = result.get("balance_before", 0)
+    new_balance = result.get("balance_after", 0)
 
     logger.info(f"[User] 用户 {request.user_id} 充值成功: +{request.amount}, 操作者: {operator_name}")
 
@@ -783,14 +755,14 @@ async def recharge_user_account(
         target_class="_User",
         target_id=request.user_id,
         target_name=target_user.get("username", ""),
-        description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 金币，余额 {current_balance} → {new_balance}",
+        description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 积分，余额 {current_balance} → {new_balance}",
         detail={
             "amount": float(request.amount),
             "target_user_id": request.user_id,
             "target_username": target_user.get("username", ""),
             "balance_before": current_balance,
             "balance_after": new_balance,
-            "record_id": result.get("objectId"),
+            "record_id": result.get("recordId"),
         },
         request=http_request,
         operator_name=operator_name,
@@ -802,7 +774,7 @@ async def recharge_user_account(
         "message": "充值成功",
         "amount": request.amount,
         "new_balance": new_balance,
-        "record_id": result.get("objectId")
+        "record_id": result.get("recordId"),
     }
 
 

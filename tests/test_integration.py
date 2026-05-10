@@ -280,16 +280,15 @@ async def test_comment_operation():
 # ============ 业务逻辑测试（FastAPI处理）============
 
 @pytest.mark.asyncio
-async def test_incentive_claim_via_fastapi():
-    """测试通过FastAPI领取每日奖励（业务逻辑在FastAPI）"""
+async def test_daily_sign_via_fastapi():
+    """测试每日签到发放账户积分（业务逻辑在FastAPI）"""
     if not TestConfig.jwt_token:
         pytest.skip("需要先登录")
     
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{BASE_URL}/api/v1/incentive/grant",
+            f"{BASE_URL}/api/v1/incentive/daily-sign",
             headers={"Authorization": f"Bearer {TestConfig.jwt_token}"},
-            json={"user_id": TestConfig.created_user_id, "amount": 100, "type": "daily", "description": "测试每日奖励"}
         )
         
         # 可能成功或已领取

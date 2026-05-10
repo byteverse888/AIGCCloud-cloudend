@@ -692,19 +692,43 @@ class ParseClient:
             "method": {"type": "String"},
             "status": {"type": "String"},
         },
-        # 平台账户明细
+        # 平台账户明细（所有 totalIncentive 变动都必须在此留痕）
         "AccountRecord": {
             "userId": {"type": "String"},
-            "type": {"type": "String"},
-            "category": {"type": "String"},
-            "amount": {"type": "Number"},
+            "username": {"type": "String"},
+            "type": {"type": "String"},          # recharge/purchase/refund/reward/exchange/consume/settlement
+            "category": {"type": "String"},      # admin_recharge/product_purchase/product_income/task_cost/task_refund/daily_sign/exchange_to_web3/exchange_to_balance 等
+            "amount": {"type": "Number"},        # 变动金额（正加负减）
             "balance_before": {"type": "Number"},
             "balance_after": {"type": "Number"},
-            "balance": {"type": "Number"},
+            "balance": {"type": "Number"},       # 兼容旧字段，=balance_after
             "description": {"type": "String"},
             "relatedOrderNo": {"type": "String"},
+            "relatedId": {"type": "String"},     # 幂等/去重 key（product_id/task_id/order_id/tx_hash 等）
+            "status": {"type": "String"},         # success/failed/pending
             "operator_id": {"type": "String"},
             "operator_name": {"type": "String"},
+        },
+        # 支付/结算失败补偿表（卖家入账失败、兑换失败等）
+        "FailedSettlement": {
+            "scene": {"type": "String"},         # seller_income / exchange_to_balance / exchange_to_web3 等
+            "userId": {"type": "String"},
+            "amount": {"type": "Number"},
+            "relatedId": {"type": "String"},     # order_id / tx_hash
+            "status": {"type": "String"},         # pending/retrying/success/failed
+            "retryCount": {"type": "Number"},
+            "maxRetry": {"type": "Number"},
+            "errorMessage": {"type": "String"},
+            "lastRetryAt": {"type": "String"},
+            "resolvedAt": {"type": "String"},
+        },
+        # 每日签到记录（以日期防重）
+        "DailySign": {
+            "userId": {"type": "String"},
+            "signDate": {"type": "String"},      # YYYY-MM-DD
+            "amount": {"type": "Number"},
+            "memberLevel": {"type": "String"},
+            "continuousDays": {"type": "Number"},
         },
         # 系统配置
         "SystemConfig": {
