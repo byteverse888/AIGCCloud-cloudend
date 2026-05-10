@@ -199,21 +199,43 @@ class ParseClient:
         return await self._request("POST", "/users", data)
     
     async def get_user(self, user_id: str) -> Dict[str, Any]:
-        """获取用户信息（使用 Master Key）"""
-        logger.info(f"[Parse] get_user called with user_id: {user_id}")
-        url = f"{self.base_url}/users/{user_id}"
+        """获取用户信息（使用 Master Key）
+
+        兼容入参：
+        - Parse objectId（默认 10 位字母数字）：直接 GET /users/:id
+        - 非 objectId 格式（如 username / 含中文）：回落按 username 查询，避免无意义 404 错日志
+        """
+        import re
+        uid = (user_id or "").strip()
+        if not uid:
+            return {}
+
+        # 非 Parse objectId 格式：直接按 username 查，避免 404 噪日志
+        if not re.fullmatch(r"[A-Za-z0-9]{10}", uid):
+            try:
+                res = await self.query_users(where={"username": uid}, limit=1)
+                results = res.get("results") or []
+                if results:
+                    return results[0]
+            except Exception as e:
+                logger.debug(f"[Parse] get_user 按 username 回查异常: {e}")
+            logger.warning(f"[Parse] get_user 未找到用户 (非objectId): {uid}")
+            return {}
+
+        url = f"{self.base_url}/users/{uid}"
         client = await self._get_master_client()
         try:
-            logger.info(f"[Parse] get_user URL: {url}")
             response = await client.get(url)
-            logger.info(f"[Parse] get_user response: {response.status_code} - {response.text[:100]}")
+            if response.status_code == 404:
+                logger.warning(f"[Parse] get_user 未找到用户: {uid}")
+                return {}
             if response.status_code >= 400:
-                logger.error(f"[Parse] 获取用户失败: {response.text}")
-            response.raise_for_status()
+                logger.warning(f"[Parse] 获取用户失败 {response.status_code}: {response.text[:200]}")
+                return {}
             return response.json()
         except Exception as e:
-            logger.error(f"[Parse] 获取用户异常: {str(e)}")
-            raise
+            logger.warning(f"[Parse] 获取用户异常 uid={uid}: {e}")
+            return {}
     
     async def get_current_user(self, session_token: str) -> Dict[str, Any]:
         """通过 session token 获取当前用户信息"""
@@ -426,6 +448,7 @@ class ParseClient:
             "productName": {"type": "String"},
             "buyerAddress": {"type": "String"},
             "sellerAddress": {"type": "String"},
+            "sellerId": {"type": "String"},
             "txHash": {"type": "String"},
             "paidAt": {"type": "String"},
             "completedAt": {"type": "String"},
@@ -597,6 +620,9 @@ class ParseClient:
             "copyright": {"type": "String"},
             "license": {"type": "String"},
             "assetUrl": {"type": "String"},
+            # 任务转资产溯源与幂等
+            "sourceTaskId": {"type": "String"},
+            "sourceResultIndex": {"type": "Number"},
             # 审核相关（用于展示驳回/下架原因与审核记录）
             "reviewedAt": {"type": "String"},
             "reviewedBy": {"type": "String"},

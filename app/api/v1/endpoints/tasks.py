@@ -18,6 +18,7 @@ from app.core.deps import get_current_user_id
 from app.core.deps import get_admin_user_id, get_operator_user_id
 from app.core.config import settings
 from app.core.incentive_service import incentive_service
+from app.core.operation_log import log_operation
 from app.core.logger import logger
 
 router = APIRouter()
@@ -81,7 +82,6 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
         # 更新状态为处理中
         await parse_client.update_object("AITask", task_id, {
             "status": TaskStatus.PROCESSING,
-            "updatedAt": datetime.now(timezone.utc).isoformat()
         })
         
         # TODO: 根据任务类型调用不同的AI服务
@@ -99,7 +99,6 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
                 "url": result_url,
                 "thumbnail": result_url,
             }],
-            "updatedAt": datetime.now(timezone.utc).isoformat()
         })
         
     except Exception as e:
@@ -107,7 +106,6 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
         await parse_client.update_object("AITask", task_id, {
             "status": TaskStatus.FAILED,
             "errorMessage": str(e),
-            "updatedAt": datetime.now(timezone.utc).isoformat()
         })
 
 
@@ -368,6 +366,86 @@ async def admin_delete_task(
     return {"success": True, "task_id": task.get("taskId")}
 
 
+class AdminTaskResultItem(BaseModel):
+    url: str
+    thumbnail: Optional[str] = None
+    type: Optional[str] = None
+
+
+class AdminUpdateTaskRequest(BaseModel):
+    description: Optional[str] = None
+    status: Optional[int] = None
+    results: Optional[List[AdminTaskResultItem]] = None
+    error_message: Optional[str] = None
+
+
+@router.put("/admin/{task_object_id}")
+async def admin_update_task(
+    task_object_id: str,
+    payload: AdminUpdateTaskRequest,
+    user_id: str = Depends(get_operator_user_id),
+):
+    """管理员/运营编辑 AI 任务（描述 / 状态 / 上传结果文件）"""
+    try:
+        task = await parse_client.get_object("AITask", task_object_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    prev_status = task.get("status")
+    prev_data = task.get("data") or {}
+
+    update_data: Dict[str, Any] = {}
+
+    # 描述：合并更新到 data.description（同时兼容 prompt卡口）
+    if payload.description is not None:
+        merged = dict(prev_data) if isinstance(prev_data, dict) else {}
+        merged["description"] = payload.description
+        update_data["data"] = merged
+
+    # 状态
+    if payload.status is not None:
+        update_data["status"] = payload.status
+        if payload.status == TaskStatus.COMPLETED and prev_status != TaskStatus.COMPLETED:
+            update_data["completedAt"] = datetime.now(timezone.utc).isoformat()
+
+    # 结果
+    if payload.results is not None:
+        update_data["results"] = [r.model_dump() for r in payload.results]
+
+    if payload.error_message is not None:
+        update_data["errorMessage"] = payload.error_message
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="未指定任何更新字段")
+
+    try:
+        await parse_client.update_object("AITask", task_object_id, update_data)
+    except Exception as e:
+        logger.error(f"[AdminTasks] 更新任务失败 task_object_id={task_object_id}: {e}")
+        raise HTTPException(status_code=500, detail="更新失败")
+
+    # 写操作日志（不阻断主流程）
+    try:
+        await log_operation(
+            operator_id=user_id,
+            action="update",
+            module="tasks",
+            target_class="AITask",
+            target_id=task_object_id,
+            target_name=task.get("taskId") or task_object_id,
+            description="管理员编辑 AI 任务",
+            detail={
+                "fields": list(update_data.keys()),
+                "prev_status": prev_status,
+                "new_status": payload.status,
+            },
+        )
+    except Exception:
+        pass
+
+    return {"success": True, "task_id": task.get("taskId"), "updated_fields": list(update_data.keys())}
+
+
 @router.post("/{task_object_id}/update-status")
 async def update_task_status(
     task_object_id: str,
@@ -384,7 +462,6 @@ async def update_task_status(
     
     update_data = {
         "status": request.status,
-        "updatedAt": datetime.now(timezone.utc).isoformat()
     }
     
     if request.results:
@@ -803,7 +880,6 @@ async def complete_task(request: CompleteTaskRequest):
         "executor": request.executor,
         "results": verified_results,
         "completedAt": datetime.now(timezone.utc).isoformat(),
-        "updatedAt": datetime.now(timezone.utc).isoformat()
     }
     await parse_client.update_object("AITask", task_object_id, update_data)
     logger.info(f"[任务完成] 任务状态已更新: {request.task_id}")
@@ -933,42 +1009,111 @@ async def convert_task_to_asset(
     task_id: str,
     user_id: str = Depends(get_current_user_id)
 ):
-    """将AIGC任务结果转换为AI资产"""
+    """将AIGC任务的所有已完成结果转换为AI资产（支持多结果 + 幂等）"""
+    # 先按业务 taskId 查，查不到再按 Parse objectId 查找（兼容旧数据/taskId 缺失场景）
     tasks = await parse_client.query_objects("AITask", where={"taskId": task_id})
-    if not tasks.get("results"):
+    task = None
+    if tasks.get("results"):
+        task = tasks["results"][0]
+    else:
+        try:
+            task = await parse_client.get_object("AITask", task_id)
+        except Exception:
+            task = None
+    if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    
-    task = tasks["results"][0]
-    
+
+    # 统一使用任务业务ID作为溯源键（没有则用 objectId）
+    source_task_id = task.get("taskId") or task.get("objectId") or task_id
+
     designer = task.get("designer")
     if designer != user_id:
         raise HTTPException(status_code=403, detail="无权操作")
-    
+
     if task.get("status") not in [2, 4]:
         raise HTTPException(status_code=400, detail="任务未完成")
-    
+
     results = task.get("results", [])
     if not results:
         raise HTTPException(status_code=400, detail="无有效结果")
-    
-    result = results[0]
-    task_type = task.get("type", "")
-    
-    asset_data = {
-        "name": f"{task_type}_{task_id[:8]}",
-        "category": _map_type_to_category(task_type),
-        "cover": result.get("thumbnail") or result.get("url"),
-        "assetUrl": result.get("url"),
-        "fileUrl": result.get("url"),
-        "status": "draft",
-        "ownerId": user_id,
-        "ownerAddress": task.get("ownerAddress", ""),
-        "copyright": task.get("ownerAddress", ""),
-        "license": "CC-BY-NC-ND",
-        "views": 0,
-        "description": task.get("data", {}).get("prompt", ""),
+
+    # 幂等：查询已转换的 result 索引
+    existed = await parse_client.query_objects(
+        "AIIPAsset",
+        where={"sourceTaskId": source_task_id, "ownerId": user_id},
+        limit=1000,
+    )
+    converted_indexes = {
+        item.get("sourceResultIndex")
+        for item in existed.get("results", [])
+        if item.get("sourceResultIndex") is not None
     }
-    
-    create_result = await parse_client.create_object("AIIPAsset", asset_data)
-    
-    return {"success": True, "asset_id": create_result.get("objectId")}
+
+    task_type = task.get("type", "")
+    category = _map_type_to_category(task_type)
+    prompt = task.get("data", {}).get("prompt", "") or ""
+
+    # 优先用任务记录的 ownerAddress；为空则回查当前用户的 web3Address；
+    # 再不行就用 user_id 兑底，确保与用户端查询可匹配
+    owner_address = task.get("ownerAddress") or ""
+    if not owner_address:
+        try:
+            user_info = await parse_client.get_user(user_id)
+            owner_address = user_info.get("web3Address") or ""
+        except Exception:
+            owner_address = ""
+    if not owner_address:
+        owner_address = user_id
+
+    asset_ids: List[str] = []
+    skipped_count = 0
+
+    for idx, result in enumerate(results):
+        if idx in converted_indexes:
+            skipped_count += 1
+            continue
+        url = result.get("url")
+        if not url:
+            skipped_count += 1
+            continue
+
+        name = f"{task_type}_{source_task_id[:8]}"
+        if len(results) > 1:
+            name = f"{name}_{idx + 1}"
+
+        asset_data = {
+            "name": name,
+            "category": category,
+            "cover": result.get("thumbnail") or url,
+            "assetUrl": url,
+            "status": "draft",
+            "ownerId": user_id,
+            "ownerAddress": owner_address,
+            "copyright": owner_address,
+            "license": "CC-BY-NC-ND",
+            "views": 0,
+            "description": prompt,
+            "sourceTaskId": source_task_id,
+            "sourceResultIndex": idx,
+        }
+
+        create_result = await parse_client.create_object("AIIPAsset", asset_data)
+        obj_id = create_result.get("objectId")
+        if obj_id:
+            asset_ids.append(obj_id)
+
+    converted_count = len(asset_ids)
+    if converted_count == 0 and skipped_count > 0:
+        message = "该任务的结果已全部转换为资产，无需重复操作"
+    elif converted_count > 0 and skipped_count > 0:
+        message = f"成功转换 {converted_count} 个新资产，已跳过 {skipped_count} 个已转换结果"
+    else:
+        message = f"成功转换 {converted_count} 个资产"
+
+    return {
+        "success": True,
+        "asset_ids": asset_ids,
+        "converted_count": converted_count,
+        "skipped_count": skipped_count,
+        "message": message,
+    }

@@ -237,13 +237,35 @@ class IncentiveService:
         plan_name: str,
         member_level: str,
         order_id: Optional[str] = None,
+        price: Optional[float] = None,
         bonus: Optional[int] = None,
     ) -> dict:
-        """会员订阅奖励（账户积分，幂等 related_id=order_id）"""
-        if bonus is not None and bonus > 0:
+        """会员订阅奖励（账户积分，幂等 related_id=order_id）
+
+        计算优先级：
+        1. 传入 price 且 > 0：按 SystemConfig.credits 的 exchangePoints : exchangeYuan
+           兑换比例赠送 = price * points / coins
+        2. 否则传入 bonus 且 > 0：直接使用
+        3. 否则回退 INCENTIVE_CONFIG 默认值
+        """
+        amount = 0.0
+        if price is not None and float(price) > 0:
+            points, coins = await self._get_exchange_rate()
+            try:
+                amount = round(float(price) * float(points) / float(coins), 2)
+            except Exception:
+                amount = 0.0
+            description = (
+                f"会员订阅奖励 - {plan_name}"
+                f"（支付 {float(price):g} 元按兑换比例赠送：{points} 积分={coins} 元）"
+            )
+        elif bonus is not None and bonus > 0:
             amount = float(bonus)
+            description = f"会员订阅奖励 - {plan_name}"
         else:
             amount = float(INCENTIVE_CONFIG.get(f"member_subscribe_{member_level}", 50))
+            description = f"会员订阅奖励 - {plan_name}"
+
         if amount <= 0:
             return {"success": True, "skipped": True, "amount": 0}
         return await self.adjust_user_balance(
@@ -251,8 +273,9 @@ class IncentiveService:
             delta=amount,
             type_="reward",
             category="member_subscribe",
-            description=f"会员订阅奖励 - {plan_name}",
+            description=description,
             related_id=order_id or f"member_subscribe_{user_id}",
+            related_order_no=order_id,
         )
 
     # ============ 账户积分激励（入 totalIncentive） ============
@@ -289,26 +312,32 @@ class IncentiveService:
         order_id: Optional[str] = None,
     ) -> dict:
         """
-        充值返利（进入账户积分余额）
+        充值赠送积分（进入账户积分余额）
 
-        默认 5% 返利，幂等以 order_id 为 key
+        按管理端 SystemConfig.credits 的兑换比例 exchangePoints : exchangeYuan
+        计算赠送金额 = recharge_amount * (points / coins)
+        例：默认 100:1 时，充 10 元 赠送 1000 积分
+        幂等以 order_id 为 key
         """
-        rate = float(INCENTIVE_CONFIG.get("recharge_rate", 0.05))
-        bonus = round(float(recharge_amount) * rate, 2)
+        points, coins = await self._get_exchange_rate()
+        try:
+            bonus = round(float(recharge_amount) * float(points) / float(coins), 2)
+        except Exception:
+            bonus = 0.0
         if bonus <= 0:
-            return {"success": False, "error": "返利金额为 0"}
+            return {"success": False, "error": "赠送积分为 0"}
         related_id = f"recharge_reward_{order_id}" if order_id else None
         result = await self.adjust_user_balance(
             user_id=user_id,
             delta=bonus,
             type_="reward",
             category="recharge_reward",
-            description=f"充值 {recharge_amount:g} 返利 {rate * 100:g}%",
+            description=f"充值 {recharge_amount:g} 元按兑换比例赠送 {bonus:g} 积分（{points} 积分={coins} 元）",
             related_id=related_id,
             related_order_no=order_id,
         )
         if result.get("success") and not result.get("skipped"):
-            return {"success": True, "amount": bonus, "message": "充值返利已发放"}
+            return {"success": True, "amount": bonus, "message": "充值赠送积分已发放"}
         return result
 
     async def grant_daily_sign_reward(self, user_id: str) -> dict:

@@ -17,6 +17,7 @@ from app.core.email_client import email_client
 from app.core.web3_client import web3_client
 from app.core.security import (
     hash_password, 
+    verify_password,
     generate_activation_token, 
     generate_reset_token,
     is_valid_ethereum_address,
@@ -84,6 +85,19 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class SetPaymentPasswordRequest(BaseModel):
+    """设置/修改支付密码请求
+    - 首次设置：old_password 可为空
+    - 修改：必须提供正确的 old_password（当前支付密码）
+    """
+    new_password: str
+    old_password: Optional[str] = None
+
+
+class VerifyPaymentPasswordRequest(BaseModel):
+    """校验支付密码请求"""
+    password: str
+
 class TransferRequest(BaseModel):
     """转账请求"""
     to_address: str
@@ -103,6 +117,7 @@ class UserResponse(BaseModel):
     web3_address: Optional[str] = None
     invite_count: int = 0
     success_reg_count: int = 0
+    has_payment_password: bool = False  # 是否已设置支付密码
     # 金币余额通过 web3_address 从联盟链获取，不存储在Parse
 
 
@@ -503,15 +518,92 @@ async def get_current_user(user_id: str = Depends(get_current_user_id)):
             web3_address=user.get("web3Address"),
             invite_count=user.get("inviteCount", 0),
             success_reg_count=user.get("successRegCount", 0),
+            has_payment_password=bool(user.get("paymentPassword")),
         )
     except Exception:
         raise HTTPException(status_code=404, detail="User not found")
 
 
+# ============ 支付密码 ============
+
+@router.get("/payment-password/status")
+async def get_payment_password_status(user_id: str = Depends(get_current_user_id)):
+    """查询当前用户是否已设置支付密码"""
+    try:
+        user = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"has_payment_password": bool(user.get("paymentPassword"))}
+
+
+@router.post("/payment-password")
+async def set_payment_password(
+    request: SetPaymentPasswordRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    设置/修改支付密码。
+    - 6-32 位任意字符
+    - 首次设置：无需 old_password
+    - 修改：必须提供正确的 old_password
+    """
+    new_pwd = (request.new_password or "").strip()
+    if len(new_pwd) < 6 or len(new_pwd) > 32:
+        raise HTTPException(status_code=400, detail="支付密码长度应为 6-32 位")
+
+    try:
+        user = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    current_hash = user.get("paymentPassword") or ""
+    if current_hash:
+        if not request.old_password:
+            raise HTTPException(status_code=400, detail="请输入当前支付密码")
+        try:
+            if not verify_password(request.old_password, current_hash):
+                raise HTTPException(status_code=400, detail="当前支付密码错误")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail="当前支付密码错误")
+
+    new_hash = hash_password(new_pwd)
+    try:
+        await parse_client.update_user_with_master_key(user_id, {"paymentPassword": new_hash})
+    except Exception as e:
+        logger.error(f"[User] 设置支付密码失败: {e}")
+        raise HTTPException(status_code=500, detail="设置支付密码失败")
+
+    return {"success": True, "message": "支付密码设置成功"}
+
+
+@router.post("/payment-password/verify")
+async def verify_payment_password(
+    request: VerifyPaymentPasswordRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """校验支付密码（仅用于前端交互检查，支付接口会再次校验）"""
+    try:
+        user = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    current_hash = user.get("paymentPassword") or ""
+    if not current_hash:
+        raise HTTPException(status_code=400, detail="未设置支付密码")
+    try:
+        ok = verify_password(request.password or "", current_hash)
+    except Exception:
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=400, detail="支付密码错误")
+    return {"success": True}
+
+
 # 已知的子路由名，防止被 /{user_id} 通配误匹配
 _RESERVED_PATHS = {"me", "register", "register-phone", "activate", "forgot-password",
                    "reset-password", "change-password", "bind-web3", "verify-web3",
-                   "admin", "wallet"}
+                   "admin", "wallet", "payment-password"}
 
 
 @router.get("/{user_id}", response_model=UserResponse)
@@ -534,6 +626,7 @@ async def get_user(user_id: str):
             web3_address=user.get("web3Address"),
             invite_count=user.get("inviteCount", 0),
             success_reg_count=user.get("successRegCount", 0),
+            has_payment_password=bool(user.get("paymentPassword")),
         )
     except Exception:
         raise HTTPException(status_code=404, detail="User not found")

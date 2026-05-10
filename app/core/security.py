@@ -13,15 +13,28 @@ from app.core.config import settings
 # 密码哈希上下文
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# bcrypt 工作因子最大接受 72 字节；新版不再自动截断，统一在应用层防御截断以防止 ValueError
+_BCRYPT_MAX_BYTES = 72
+
+
+def _truncate_for_bcrypt(password: str) -> str:
+    if not password:
+        return password
+    raw = password.encode("utf-8")
+    if len(raw) <= _BCRYPT_MAX_BYTES:
+        return password
+    # 安全截断到 72 字节，遵循 UTF-8 边界
+    return raw[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="ignore")
+
 
 def hash_password(password: str) -> str:
     """哈希密码"""
-    return pwd_context.hash(password)
+    return pwd_context.hash(_truncate_for_bcrypt(password))
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """验证密码"""
-    return pwd_context.verify(plain_password, hashed_password)
+    return pwd_context.verify(_truncate_for_bcrypt(plain_password), hashed_password)
 
 
 def generate_token(length: int = 32) -> str:

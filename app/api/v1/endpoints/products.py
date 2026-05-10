@@ -403,6 +403,73 @@ async def get_product_reports(
     }
 
 
+@router.get("/{product_id}/reports")
+async def get_reports_of_product(
+    product_id: str,
+    page: int = 1,
+    limit: int = 50,
+    user_id: str = Depends(get_operator_user_id),
+):
+    """
+    获取指定商品的所有投诉记录（管理/运营）
+    - 返回每条投诉：reporterId / reporterName / reason(中文) / description / status / createdAt
+    """
+    # 商品存在性校验
+    try:
+        await parse_client.get_object("Product", product_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="商品不存在")
+
+    skip = (page - 1) * limit
+    result = await parse_client.query_objects(
+        "ProductReport",
+        where={"productId": product_id},
+        order="-createdAt",
+        limit=limit,
+        skip=skip,
+    )
+    total = await parse_client.count_objects("ProductReport", {"productId": product_id})
+
+    user_cache: dict = {}
+
+    async def _resolve_name(uid: str) -> str:
+        if not uid:
+            return ""
+        if uid in user_cache:
+            return user_cache[uid]
+        try:
+            u = await parse_client.get_user(uid)
+            name = (u.get("username") or "") if u else ""
+        except Exception:
+            name = ""
+        user_cache[uid] = name
+        return name
+
+    reports = []
+    for r in result.get("results", []):
+        reporter_id = r.get("reporterId") or ""
+        reports.append({
+            "id": r.get("objectId"),
+            "reporterId": reporter_id,
+            "reporterName": await _resolve_name(reporter_id),
+            "reason": r.get("reason") or "",
+            "reasonText": REPORT_REASONS.get(r.get("reason"), r.get("reason") or ""),
+            "description": r.get("description") or "",
+            "status": r.get("status") or "pending",
+            "createdAt": r.get("createdAt"),
+            "processedAt": r.get("processedAt"),
+            "processedBy": r.get("processedBy"),
+            "processNote": r.get("processNote"),
+        })
+
+    return {
+        "data": reports,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
 @router.post("/reports/{report_id}/process")
 async def process_report(
     report_id: str,

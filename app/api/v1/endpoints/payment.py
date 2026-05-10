@@ -498,22 +498,23 @@ async def verify_web3_transfer(request: VerifyTransferRequest):
         # 订单完成：从买家购物车中清除该商品（幂等）
         await _remove_product_from_user_cart(order.get("userId"), product_id)
 
-        # 11. 发放充值奖励（如果是购买订单）
+        # 11. 发放充值赠送积分（仅限 recharge 类型订单，购买/订阅不发）
         try:
+            order_type = order.get("type")
             user_id = order.get("userId")
             order_amount = float(order.get("amount", 0))
-            if user_id and order_amount > 0:
+            if order_type == "recharge" and user_id and order_amount > 0:
                 reward_result = await incentive_service.grant_recharge_reward(
                     user_id=user_id,
                     recharge_amount=order_amount,
                     order_id=request.order_id
                 )
                 if reward_result.get("success"):
-                    logger.info(f"[验证转账] 充值奖励已发放: {reward_result.get('amount')} 金币")
+                    logger.info(f"[验证转账] 充值赠送积分已发放: {reward_result.get('amount')} 积分")
                 else:
-                    logger.warning(f"[验证转账] 充值奖励发放失败: {reward_result.get('error')}")
+                    logger.warning(f"[验证转账] 充值赠送积分发放失败: {reward_result.get('error')}")
         except Exception as e:
-            logger.error(f"[验证转账] 发放充值奖励异常: {e}")
+            logger.error(f"[验证转账] 发放充值赠送积分异常: {e}")
         
         return {
             "success": True,

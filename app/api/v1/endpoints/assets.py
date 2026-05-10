@@ -10,7 +10,7 @@ import uuid
 from app.core.parse_client import parse_client
 from app.core.redis_client import redis_client
 from app.core.deps import get_current_user_id, get_operator_user_id
-from app.core.security import generate_order_no
+from app.core.security import generate_order_no, verify_password
 from app.core.logger import logger
 from app.core.operation_log import log_operation
 from app.core.incentive_service import incentive_service
@@ -40,7 +40,39 @@ class AssetUpdateRequest(BaseModel):
     copyright: Optional[str] = None
     license: Optional[str] = None
     tags: Optional[List[str]] = None
+    price: Optional[float] = None
 
+
+class BatchSubmitItem(BaseModel):
+    asset_id: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    price: float = 0
+
+
+class BatchSubmitRequest(BaseModel):
+    items: List[BatchSubmitItem]
+
+
+class BalancePayRequest(BaseModel):
+    """账户积分余额支付请求"""
+    payment_password: str
+
+
+def _require_payment_password(user: dict, input_password: str) -> None:
+    """校验用户已设置且输入正确的支付密码。失败时直接抛 HTTPException。"""
+    pwd_hash = (user.get("paymentPassword") or "") if user else ""
+    if not pwd_hash:
+        raise HTTPException(status_code=400, detail="请先设置支付密码")
+    if not input_password:
+        raise HTTPException(status_code=400, detail="请输入支付密码")
+    try:
+        ok = verify_password(input_password, pwd_hash)
+    except Exception:
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=400, detail="支付密码错误")
 
 @router.post("/publish")
 async def publish_asset(
@@ -163,339 +195,7 @@ async def get_purchased_assets(
     return {"data": purchases, "total": total, "page": page, "limit": limit}
 
 
-@router.get("/{asset_id}")
-async def get_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
-    """获取资产详情"""
-    try:
-        asset = await parse_client.get_object("Product", asset_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="资产不存在")
-    
-    creator_id = asset.get("creatorId")
-    owner = asset.get("owner")
-    is_public = asset.get("status") == "approved"
-    is_owner = creator_id == user_id or owner == user_id
-    
-    if not is_public and not is_owner:
-        return {
-            "id": asset.get("objectId"),
-            "name": asset.get("name"),
-            "category": asset.get("category"),
-            "status": asset.get("status"),
-        }
-    
-    return {
-        "id": asset.get("objectId"),
-        "name": asset.get("name"),
-        "description": asset.get("description"),
-        "category": asset.get("category"),
-        "price": asset.get("price", 0),
-        "status": asset.get("status"),
-        "sales": asset.get("sales", 0),
-        "coverKey": asset.get("coverKey"),
-        "creatorId": creator_id,
-        "owner": owner,
-        "createdAt": asset.get("createdAt"),
-    }
-
-
-@router.put("/{asset_id}")
-async def update_asset(
-    asset_id: str,
-    request: AssetUpdateRequest,
-    user_id: str = Depends(get_current_user_id)
-):
-    """编辑AI资产"""
-    try:
-        asset = await parse_client.get_object("Product", asset_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="资产不存在")
-    
-    creator_id = asset.get("creatorId")
-    owner = asset.get("owner")
-    if creator_id != user_id and owner != user_id:
-        raise HTTPException(status_code=403, detail="无权编辑")
-    
-    if asset.get("status") not in ["draft", ""]:
-        raise HTTPException(status_code=400, detail="只有草稿状态可编辑")
-    
-    update_data = {k: v for k, v in request.dict(exclude_unset=True).items() if v is not None}
-    
-    if request.tags is not None:
-        update_data["tags"] = request.tags
-    
-    if update_data:
-        await parse_client.update_object("Product", asset_id, update_data)
-    
-    return {"success": True, "message": "资产已更新"}
-
-
-@router.post("/{asset_id}/submit")
-async def submit_for_review(
-    asset_id: str,
-    user_id: str = Depends(get_current_user_id)
-):
-    """提交AI资产审核"""
-    try:
-        asset = await parse_client.get_object("AIIPAsset", asset_id)
-    except Exception:
-        try:
-            asset = await parse_client.get_object("Product", asset_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="资产不存在")
-    
-    owner_id = asset.get("ownerId") or asset.get("creatorId")
-    if owner_id != user_id:
-        raise HTTPException(status_code=403, detail="无权操作")
-    
-    current_status = asset.get("status", "")
-    if current_status not in ["draft", ""]:
-        raise HTTPException(status_code=400, detail="只有草稿可提交审核")
-    
-    product_data = {
-        "name": asset.get("name"),
-        "description": asset.get("description") or "",
-        "cover": asset.get("cover") or asset.get("coverKey", ""),
-        "category": asset.get("category"),
-        "status": "pending",
-        "creatorId": user_id,
-        "owner": user_id,
-        "copyright": asset.get("copyright", ""),
-        "license": asset.get("license", "CC-BY-NC-ND"),
-        "sales": 0,
-        "likeCount": 0,
-        "favoriteCount": 0,
-        "views": 0,
-        "commentCount": 0,
-    }
-    
-    product_result = await parse_client.create_object("Product", product_data)
-    product_id = product_result.get("objectId")
-    
-    await parse_client.update_object("AIIPAsset", asset_id, {
-        "status": "pending",
-        "listedProductId": product_id,
-        "isListed": True,
-    })
-    
-    return {"success": True, "product_id": product_id, "message": "已提交审核"}
-
-
-@router.post("/{asset_id}/purchase")
-async def purchase_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
-    """购买资产"""
-    # 获取资产信息
-    try:
-        asset = await parse_client.get_object("Product", asset_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="资产不存在")
-    
-    # 检查资产状态
-    if asset.get("status") != "approved":
-        raise HTTPException(status_code=400, detail="该资产暂不可购买")
-    
-    # 检查是否是自己发布的
-    if asset.get("creatorId") == user_id:
-        raise HTTPException(status_code=400, detail="不能购买自己发布的资产")
-    
-    # 检查是否已购买
-    existing = await parse_client.query_objects(
-        "Order",
-        where={"userId": user_id, "productId": asset_id, "status": "completed"}
-    )
-    if existing.get("results"):
-        raise HTTPException(status_code=400, detail="您已购买过该资产")
-    
-    price = float(asset.get("price", 0))
-    creator_id = asset.get("creatorId")
-    
-    # 免费资产直接转移所有权
-    if price == 0:
-        await parse_client.update_object("Product", asset_id, {
-            "owner": user_id,
-            "sales": parse_client.increment(1)
-        })
-        await parse_client.create_object("Order", {
-            "orderNo": generate_order_no(),
-            "userId": user_id,
-            "productId": asset_id,
-            "productName": asset.get("name"),
-            "amount": 0,
-            "type": "purchase",
-            "status": "completed",
-            "completedAt": datetime.now(timezone.utc).isoformat(),
-        })
-        return {"success": True, "message": "资产已获取", "free": True}
-    
-    # 付费资产创建订单
-    order_no = generate_order_no()
-    await parse_client.create_object("Order", {
-        "orderNo": order_no,
-        "userId": user_id,
-        "productId": asset_id,
-        "productName": asset.get("name"),
-        "amount": price,
-        "type": "purchase",
-        "status": "pending",
-    })
-    
-    return {
-        "success": True,
-        "order_id": order_no,
-        "amount": price,
-        "message": "订单已创建，请完成支付"
-    }
-
-
-@router.post("/{asset_id}/purchase-with-balance")
-async def purchase_asset_with_balance(
-    asset_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
-    """
-    使用用户积分余额（totalIncentive）购买商品。
-    - 校验商品存在且 approved
-    - 校验非自己的商品
-    - 校验之前未完成过该商品的购买
-    - 校验余额充足
-    - 原子扣卖家 / 增买家、Product.sales+1、创建 completed 订单
-    - 同步从购物车移除
-    """
-    # 1. 商品校验
-    try:
-        asset = await parse_client.get_object("Product", asset_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="商品不存在")
-
-    if asset.get("status") != "approved":
-        raise HTTPException(status_code=400, detail="该商品暂不可购买")
-
-    creator_id = asset.get("creatorId")
-    if creator_id == user_id:
-        raise HTTPException(status_code=400, detail="不能购买自己的商品")
-
-    # 2. 重复购买校验
-    existing = await parse_client.query_objects(
-        "Order",
-        where={"userId": user_id, "productId": asset_id, "status": "completed"}
-    )
-    if existing.get("results"):
-        raise HTTPException(status_code=400, detail="您已购买过该商品")
-
-    price = float(asset.get("price", 0) or 0)
-    
-    # 3. 余额校验（免费商品直接通过）
-    try:
-        buyer = await parse_client.get_user(user_id)
-    except Exception:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    balance = incentive_service._read_balance(buyer)
-    if price > 0 and balance < price:
-        raise HTTPException(status_code=400, detail=f"积分余额不足，需要 {price:g} 积分，当前 {balance:g}")
-    
-    # 4. 先创建订单（需要 orderNo 作为账本 relatedOrderNo）
-    order_no = generate_order_no()
-    
-    # 5. 扣买家（统一账本）
-    if price > 0:
-        buyer_result = await incentive_service.adjust_user_balance(
-            user_id=user_id,
-            delta=-float(price),
-            type_="purchase",
-            category="product_purchase",
-            description=f"购买商品: {asset.get('name', '')}",
-            related_id=f"purchase_{order_no}",
-            related_order_no=order_no,
-        )
-        if not buyer_result.get("success"):
-            raise HTTPException(status_code=500, detail=buyer_result.get("error", "扣减余额失败"))
-
-        # 6. 卖家入账（失败则回滚买家，整体交易失败）
-        if creator_id:
-            seller_result = await incentive_service.adjust_user_balance(
-                user_id=creator_id,
-                delta=float(price),
-                type_="reward",
-                category="product_income",
-                description=f"商品售卖收入: {asset.get('name', '')}",
-                related_id=f"income_{order_no}",
-                related_order_no=order_no,
-            )
-            if not seller_result.get("success"):
-                # 回滚买家扣款
-                logger.error(
-                    f"[积分支付] 卖家入账失败，回滚买家: buyer={user_id} seller={creator_id} price={price} err={seller_result.get('error')}"
-                )
-                try:
-                    await incentive_service.adjust_user_balance(
-                        user_id=user_id,
-                        delta=float(price),
-                        type_="refund",
-                        category="purchase_rollback",
-                        description=f"商品购买回滚（卖家入账失败）: {asset.get('name', '')}",
-                        related_id=f"purchase_rollback_{order_no}",
-                        related_order_no=order_no,
-                        check_idempotent=False,
-                    )
-                except Exception as _re:
-                    logger.error(f"[积分支付] 买家回滚异常: {_re}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"卖家入账失败，交易已回滚: {seller_result.get('error', '')}",
-                )
-    
-    # 7. 商品销售数 +1（失败不阻断）
-    try:
-        await parse_client.update_object("Product", asset_id, {
-            "sales": parse_client.increment(1)
-        })
-    except Exception as e:
-        logger.warning(f"[积分支付] 更新商品销量失败: {e}")
-    
-    # 8. 创建 completed 订单
-    try:
-        await parse_client.create_object("Order", {
-            "orderNo": order_no,
-            "userId": user_id,
-            "productId": asset_id,
-            "productName": asset.get("name"),
-            "amount": price,
-            "type": "purchase",
-            "payMethod": "balance",
-            "status": "completed",
-            "completedAt": datetime.now(timezone.utc).isoformat(),
-            "sellerId": creator_id,
-        })
-    except Exception as e:
-        logger.error(f"[积分支付] 创建订单失败: {e}")
-    
-    # 9. 同步从购物车移除（失败不阻断）
-    try:
-        import json
-        cart_key = f"cart:{user_id}"
-        cart_data = await redis_client.get(cart_key)
-        if cart_data:
-            items = json.loads(cart_data)
-            new_items = [it for it in items if it.get("asset_id") != asset_id]
-            if new_items:
-                try:
-                    ttl = await redis_client.client.ttl(cart_key)
-                except Exception:
-                    ttl = 0
-                ttl = ttl if (isinstance(ttl, int) and ttl > 0) else CART_TTL
-                await redis_client.set(cart_key, json.dumps(new_items), ex=ttl)
-            else:
-                await redis_client.delete(cart_key)
-    except Exception as e:
-        logger.warning(f"[积分支付] 同步购物车失败（忽略）: {e}")
-    
-    return {
-        "success": True,
-        "order_no": order_no,
-        "amount": price,
-        "message": "购买成功",
-    }
-
+# ============ 购物车接口（必须在 /{asset_id} 通配路由之前注册）============
 
 @router.get("/cart")
 async def get_cart(user_id: str = Depends(get_current_user_id)):
@@ -618,6 +318,495 @@ async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_use
         await redis_client.delete(cart_key)
 
     return {"success": True, "message": "已从购物车移除", "count": len(cart_items)}
+
+
+@router.get("/{asset_id}")
+async def get_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
+    """获取资产详情"""
+    try:
+        asset = await parse_client.get_object("Product", asset_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="资产不存在")
+    
+    creator_id = asset.get("creatorId")
+    owner = asset.get("owner")
+    is_public = asset.get("status") == "approved"
+    is_owner = creator_id == user_id or owner == user_id
+    
+    if not is_public and not is_owner:
+        return {
+            "id": asset.get("objectId"),
+            "name": asset.get("name"),
+            "category": asset.get("category"),
+            "status": asset.get("status"),
+        }
+    
+    return {
+        "id": asset.get("objectId"),
+        "name": asset.get("name"),
+        "description": asset.get("description"),
+        "category": asset.get("category"),
+        "price": asset.get("price", 0),
+        "status": asset.get("status"),
+        "sales": asset.get("sales", 0),
+        "coverKey": asset.get("coverKey"),
+        "creatorId": creator_id,
+        "owner": owner,
+        "createdAt": asset.get("createdAt"),
+    }
+
+
+@router.put("/{asset_id}")
+async def update_asset(
+    asset_id: str,
+    request: AssetUpdateRequest,
+    user_id: str = Depends(get_current_user_id)
+):
+    """编辑AI资产（兼容 AIIPAsset / Product 两类 ID）"""
+    # 先当作 AIIPAsset 查，回落 Product
+    asset_cls = ""
+    asset = None
+    try:
+        asset = await parse_client.get_object("AIIPAsset", asset_id)
+        asset_cls = "AIIPAsset"
+    except Exception:
+        try:
+            asset = await parse_client.get_object("Product", asset_id)
+            asset_cls = "Product"
+        except Exception:
+            raise HTTPException(status_code=404, detail="资产不存在")
+
+    creator_id = asset.get("creatorId") or asset.get("ownerId")
+    owner = asset.get("owner")
+    if creator_id != user_id and owner != user_id:
+        raise HTTPException(status_code=403, detail="无权编辑")
+
+    # 可编辑状态：draft / offline / rejected / 空
+    current_status = asset.get("status") or ""
+    if current_status not in ["draft", "offline", "rejected", ""]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前状态({current_status})不可编辑，请先下架或等待审核结果"
+        )
+
+    update_data = {k: v for k, v in request.dict(exclude_unset=True).items() if v is not None}
+    # cover_key → cover 字段映射
+    if "cover_key" in update_data:
+        update_data["cover"] = update_data.pop("cover_key")
+    if request.tags is not None:
+        update_data["tags"] = request.tags
+
+    if not update_data:
+        return {"success": True, "message": "无更新"}
+
+    try:
+        await parse_client.update_object(asset_cls, asset_id, update_data)
+    except Exception as e:
+        logger.error(f"[UpdateAsset] {asset_cls} 更新失败 id={asset_id}: {e}")
+        raise HTTPException(status_code=500, detail="更新失败")
+
+    # 若编辑的是 AIIPAsset 且已关联 Product（已提交/已上架过），同步关键展示字段到 Product
+    if asset_cls == "AIIPAsset":
+        listed_product_id = asset.get("listedProductId")
+        if listed_product_id:
+            product_update: dict = {}
+            for k in ("name", "description", "category", "price", "copyright", "license", "tags"):
+                if k in update_data:
+                    product_update[k] = update_data[k]
+            if "cover" in update_data:
+                product_update["cover"] = update_data["cover"]
+            if product_update:
+                try:
+                    await parse_client.update_object("Product", listed_product_id, product_update)
+                except Exception as e:
+                    logger.warning(f"[UpdateAsset] 同步 Product 失败 product_id={listed_product_id}: {e}")
+
+    return {"success": True, "message": "资产已更新"}
+
+
+@router.post("/{asset_id}/submit")
+async def submit_for_review(
+    asset_id: str,
+    user_id: str = Depends(get_current_user_id)
+):
+    """提交AI资产审核"""
+    try:
+        asset = await parse_client.get_object("AIIPAsset", asset_id)
+    except Exception:
+        try:
+            asset = await parse_client.get_object("Product", asset_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="资产不存在")
+    
+    owner_id = asset.get("ownerId") or asset.get("creatorId")
+    if owner_id != user_id:
+        raise HTTPException(status_code=403, detail="无权操作")
+    
+    current_status = asset.get("status", "")
+    if current_status not in ["draft", ""]:
+        raise HTTPException(status_code=400, detail="只有草稿可提交审核")
+    
+    product_data = {
+        "name": asset.get("name"),
+        "description": asset.get("description") or "",
+        "cover": asset.get("cover") or asset.get("coverKey", ""),
+        "category": asset.get("category"),
+        "status": "pending",
+        "creatorId": user_id,
+        "owner": user_id,
+        "copyright": asset.get("copyright", ""),
+        "license": asset.get("license", "CC-BY-NC-ND"),
+        "sales": 0,
+        "likeCount": 0,
+        "favoriteCount": 0,
+        "views": 0,
+        "commentCount": 0,
+    }
+    
+    product_result = await parse_client.create_object("Product", product_data)
+    product_id = product_result.get("objectId")
+    
+    await parse_client.update_object("AIIPAsset", asset_id, {
+        "status": "pending",
+        "listedProductId": product_id,
+        "isListed": True,
+    })
+    
+    return {"success": True, "product_id": product_id, "message": "已提交审核"}
+
+
+@router.post("/batch-submit")
+async def batch_submit_for_review(
+    request: BatchSubmitRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    批量提交 AI 资产申请上架审核
+    - 对每项校验归属与状态（仅 draft/offline/rejected 或 Product 的 draft）
+    - 可同步更新 name/description/category/price
+    - 将资产置为 pending；如果是 AIIPAsset，还会创建对应 Product 条目
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="未选中任何资产")
+
+    valid_categories = ["image", "audio", "video", "model", "music", "digital-human", "comic", "other"]
+
+    async def _submit_one(item: BatchSubmitItem) -> dict:
+        aid = item.asset_id
+        try:
+            if item.price is None or item.price < 0:
+                return {"asset_id": aid, "success": False, "error": "价格不能为负数"}
+            if item.category and item.category not in valid_categories:
+                return {"asset_id": aid, "success": False, "error": "无效的资产分类"}
+
+            # 优先当作 AIIPAsset 查（任务转化产物），回落 Product（直接 publish）
+            asset_cls = ""
+            asset_data = None
+            try:
+                asset_data = await parse_client.get_object("AIIPAsset", aid)
+                asset_cls = "AIIPAsset"
+            except Exception:
+                try:
+                    asset_data = await parse_client.get_object("Product", aid)
+                    asset_cls = "Product"
+                except Exception:
+                    return {"asset_id": aid, "success": False, "error": "资产不存在"}
+
+            owner_id = asset_data.get("ownerId") or asset_data.get("creatorId") or asset_data.get("owner")
+            if owner_id != user_id:
+                return {"asset_id": aid, "success": False, "error": "无权操作该资产"}
+
+            current_status = asset_data.get("status") or ""
+            if current_status not in ("draft", "offline", "rejected", ""):
+                return {"asset_id": aid, "success": False, "error": f"资产当前状态({current_status})不可提交"}
+
+            new_name = (item.name or asset_data.get("name") or "").strip()
+            new_desc = item.description if item.description is not None else (asset_data.get("description") or "")
+            new_category = item.category or asset_data.get("category") or "other"
+            if not new_name or len(new_name) < 2:
+                return {"asset_id": aid, "success": False, "error": "资产名称至少2个字符"}
+
+            if asset_cls == "AIIPAsset":
+                product_data = {
+                    "name": new_name,
+                    "description": new_desc,
+                    "cover": asset_data.get("cover") or asset_data.get("coverKey", ""),
+                    "category": new_category,
+                    "price": float(item.price or 0),
+                    "status": "pending",
+                    "creatorId": user_id,
+                    "owner": user_id,
+                    "copyright": asset_data.get("copyright", ""),
+                    "license": asset_data.get("license", "CC-BY-NC-ND"),
+                    "sales": 0,
+                    "likeCount": 0,
+                    "favoriteCount": 0,
+                    "views": 0,
+                    "commentCount": 0,
+                }
+                prod_res = await parse_client.create_object("Product", product_data)
+                prod_id = prod_res.get("objectId")
+                await parse_client.update_object("AIIPAsset", aid, {
+                    "name": new_name,
+                    "description": new_desc,
+                    "category": new_category,
+                    "price": float(item.price or 0),
+                    "status": "pending",
+                    "listedProductId": prod_id,
+                    "isListed": True,
+                })
+                return {"asset_id": aid, "success": True, "product_id": prod_id}
+            else:
+                # Product 直接更新
+                update_data = {
+                    "name": new_name,
+                    "description": new_desc,
+                    "category": new_category,
+                    "price": float(item.price or 0),
+                    "status": "pending",
+                }
+                await parse_client.update_object("Product", aid, update_data)
+                return {"asset_id": aid, "success": True, "product_id": aid}
+        except Exception as e:
+            logger.error(f"[BatchSubmit] 处理失败 asset_id={aid}: {e}")
+            return {"asset_id": aid, "success": False, "error": str(e)}
+
+    import asyncio
+    results = await asyncio.gather(*[_submit_one(item) for item in request.items])
+    success_count = sum(1 for r in results if r.get("success"))
+    return {
+        "success": True,
+        "total": len(request.items),
+        "success_count": success_count,
+        "failed_count": len(request.items) - success_count,
+        "results": results,
+    }
+
+
+@router.post("/{asset_id}/purchase")
+async def purchase_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
+    """购买资产"""
+    # 获取资产信息
+    try:
+        asset = await parse_client.get_object("Product", asset_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="资产不存在")
+    
+    # 检查资产状态
+    if asset.get("status") != "approved":
+        raise HTTPException(status_code=400, detail="该资产暂不可购买")
+    
+    # 检查是否是自己发布的
+    if asset.get("creatorId") == user_id:
+        raise HTTPException(status_code=400, detail="不能购买自己发布的资产")
+    
+    # 检查是否已购买
+    existing = await parse_client.query_objects(
+        "Order",
+        where={"userId": user_id, "productId": asset_id, "status": "completed"}
+    )
+    if existing.get("results"):
+        raise HTTPException(status_code=400, detail="您已购买过该资产")
+    
+    price = float(asset.get("price", 0))
+    creator_id = asset.get("creatorId")
+    
+    # 免费资产直接转移所有权
+    if price == 0:
+        await parse_client.update_object("Product", asset_id, {
+            "owner": user_id,
+            "sales": parse_client.increment(1)
+        })
+        await parse_client.create_object("Order", {
+            "orderNo": generate_order_no(),
+            "userId": user_id,
+            "productId": asset_id,
+            "productName": asset.get("name"),
+            "amount": 0,
+            "type": "purchase",
+            "status": "completed",
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+        })
+        return {"success": True, "message": "资产已获取", "free": True}
+    
+    # 付费资产创建订单
+    order_no = generate_order_no()
+    await parse_client.create_object("Order", {
+        "orderNo": order_no,
+        "userId": user_id,
+        "productId": asset_id,
+        "productName": asset.get("name"),
+        "amount": price,
+        "type": "purchase",
+        "status": "pending",
+    })
+    
+    return {
+        "success": True,
+        "order_id": order_no,
+        "amount": price,
+        "message": "订单已创建，请完成支付"
+    }
+
+
+@router.post("/{asset_id}/purchase-with-balance")
+async def purchase_asset_with_balance(
+    asset_id: str,
+    request: BalancePayRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    使用用户积分余额（totalIncentive）购买商品。
+    - 校验商品存在且 approved
+    - 校验非自己的商品
+    - 校验之前未完成过该商品的购买
+    - 校验支付密码
+    - 校验余额充足
+    - 原子扣卖家 / 增买家、Product.sales+1、创建 completed 订单
+    - 同步从购物车移除
+    """
+    # 1. 商品校验
+    try:
+        asset = await parse_client.get_object("Product", asset_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="商品不存在")
+
+    if asset.get("status") != "approved":
+        raise HTTPException(status_code=400, detail="该商品暂不可购买")
+
+    creator_id = asset.get("creatorId")
+    if creator_id == user_id:
+        raise HTTPException(status_code=400, detail="不能购买自己的商品")
+
+    # 2. 重复购买校验
+    existing = await parse_client.query_objects(
+        "Order",
+        where={"userId": user_id, "productId": asset_id, "status": "completed"}
+    )
+    if existing.get("results"):
+        raise HTTPException(status_code=400, detail="您已购买过该商品")
+
+    price = float(asset.get("price", 0) or 0)
+    
+    # 3. 余额校验（免费商品直接通过）
+    try:
+        buyer = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    # 4. 支付密码校验（仅需真实扣款时校验；免费商品跳过）
+    if price > 0:
+        _require_payment_password(buyer, request.payment_password)
+
+    balance = incentive_service._read_balance(buyer)
+    if price > 0 and balance < price:
+        raise HTTPException(status_code=400, detail=f"积分余额不足，需要 {price:g} 积分，当前 {balance:g}")
+    
+    # 4. 先创建订单（需要 orderNo 作为账本 relatedOrderNo）
+    order_no = generate_order_no()
+    
+    # 5. 扣买家（统一账本）
+    if price > 0:
+        buyer_result = await incentive_service.adjust_user_balance(
+            user_id=user_id,
+            delta=-float(price),
+            type_="purchase",
+            category="product_purchase",
+            description=f"购买商品: {asset.get('name', '')}",
+            related_id=f"purchase_{order_no}",
+            related_order_no=order_no,
+        )
+        if not buyer_result.get("success"):
+            raise HTTPException(status_code=500, detail=buyer_result.get("error", "扣减余额失败"))
+
+        # 6. 卖家入账（失败则回滚买家，整体交易失败）
+        if creator_id:
+            seller_result = await incentive_service.adjust_user_balance(
+                user_id=creator_id,
+                delta=float(price),
+                type_="reward",
+                category="product_income",
+                description=f"商品售卖收入: {asset.get('name', '')}",
+                related_id=f"income_{order_no}",
+                related_order_no=order_no,
+            )
+            if not seller_result.get("success"):
+                # 回滚买家扣款
+                logger.error(
+                    f"[积分支付] 卖家入账失败，回滚买家: buyer={user_id} seller={creator_id} price={price} err={seller_result.get('error')}"
+                )
+                try:
+                    await incentive_service.adjust_user_balance(
+                        user_id=user_id,
+                        delta=float(price),
+                        type_="refund",
+                        category="purchase_rollback",
+                        description=f"商品购买回滚（卖家入账失败）: {asset.get('name', '')}",
+                        related_id=f"purchase_rollback_{order_no}",
+                        related_order_no=order_no,
+                        check_idempotent=False,
+                    )
+                except Exception as _re:
+                    logger.error(f"[积分支付] 买家回滚异常: {_re}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"卖家入账失败，交易已回滚: {seller_result.get('error', '')}",
+                )
+    
+    # 7. 商品销售数 +1（失败不阻断）
+    try:
+        await parse_client.update_object("Product", asset_id, {
+            "sales": parse_client.increment(1)
+        })
+    except Exception as e:
+        logger.warning(f"[积分支付] 更新商品销量失败: {e}")
+    
+    # 8. 创建 completed 订单
+    try:
+        await parse_client.create_object("Order", {
+            "orderNo": order_no,
+            "userId": user_id,
+            "productId": asset_id,
+            "productName": asset.get("name"),
+            "amount": price,
+            "type": "purchase",
+            "paymentMethod": "balance",
+            "status": "completed",
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+            "sellerId": creator_id,
+        })
+    except Exception as e:
+        logger.error(f"[积分支付] 创建订单失败: {e}")
+    
+    # 9. 同步从购物车移除（失败不阻断）
+    try:
+        import json
+        cart_key = f"cart:{user_id}"
+        cart_data = await redis_client.get(cart_key)
+        if cart_data:
+            items = json.loads(cart_data)
+            new_items = [it for it in items if it.get("asset_id") != asset_id]
+            if new_items:
+                try:
+                    ttl = await redis_client.client.ttl(cart_key)
+                except Exception:
+                    ttl = 0
+                ttl = ttl if (isinstance(ttl, int) and ttl > 0) else CART_TTL
+                await redis_client.set(cart_key, json.dumps(new_items), ex=ttl)
+            else:
+                await redis_client.delete(cart_key)
+    except Exception as e:
+        logger.warning(f"[积分支付] 同步购物车失败（忽略）: {e}")
+    
+    return {
+        "success": True,
+        "order_no": order_no,
+        "amount": price,
+        "message": "购买成功",
+    }
+
+
+# ============ 购物车接口（必须在 /{asset_id} 通配路由之前注册）============
 
 
 # ============ 管理/运营端接口 ============
@@ -791,6 +980,38 @@ async def admin_review_asset(
             await parse_client.update_object("Product", listed_product_id, product_update)
         except Exception as e:
             logger.warning(f"[Admin][AI资产审核] 同步 Product 状态失败: {e}")
+    elif request.status == "approved":
+        # 兑底：历史数据或旧路径未创建 Product，审批通过时自动创建，确保商城可见
+        try:
+            product_data = {
+                "name": asset.get("name") or "",
+                "description": asset.get("description") or "",
+                "cover": asset.get("cover") or asset.get("coverKey", ""),
+                "category": asset.get("category") or "other",
+                "price": float(asset.get("price") or 0),
+                "status": "approved",
+                "creatorId": asset.get("ownerId") or asset.get("creatorId") or "",
+                "owner": asset.get("ownerId") or asset.get("owner") or "",
+                "copyright": asset.get("copyright", ""),
+                "license": asset.get("license", "CC-BY-NC-ND"),
+                "reviewedAt": update_data["reviewedAt"],
+                "reviewedBy": operator_id,
+                "reviewNote": request.review_note or "",
+                "sales": 0,
+                "likeCount": 0,
+                "favoriteCount": 0,
+                "views": 0,
+                "commentCount": 0,
+            }
+            prod_res = await parse_client.create_object("Product", product_data)
+            prod_id = prod_res.get("objectId")
+            if prod_id:
+                await parse_client.update_object("AIIPAsset", request.asset_id, {
+                    "listedProductId": prod_id,
+                    "isListed": True,
+                })
+        except Exception as e:
+            logger.warning(f"[Admin][AI资产审核] 兑底创建 Product 失败: {e}")
 
     await log_operation(
         operator_id=operator_id,
@@ -871,7 +1092,10 @@ async def checkout_cart(user_id: str = Depends(get_current_user_id)):
 
 
 @router.post("/cart/checkout-with-balance")
-async def checkout_cart_with_balance(user_id: str = Depends(get_current_user_id)):
+async def checkout_cart_with_balance(
+    request: BalancePayRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     使用账户积分余额结算购物车（批量支付）。
     步骤：
@@ -934,6 +1158,11 @@ async def checkout_cart_with_balance(user_id: str = Depends(get_current_user_id)
         buyer = await parse_client.get_user(user_id)
     except Exception:
         raise HTTPException(status_code=404, detail="用户不存在")
+
+    # 2.1 支付密码校验（总价 > 0 才校验；全免费跳过）
+    if total_amount > 0:
+        _require_payment_password(buyer, request.payment_password)
+
     balance = incentive_service._read_balance(buyer)
     if total_amount > 0 and balance < total_amount:
         raise HTTPException(
@@ -1017,7 +1246,7 @@ async def checkout_cart_with_balance(user_id: str = Depends(get_current_user_id)
                 "productName": product.get("name"),
                 "amount": price,
                 "type": "purchase",
-                "payMethod": "balance",
+                "paymentMethod": "balance",
                 "status": "completed",
                 "completedAt": datetime.now(timezone.utc).isoformat(),
                 "sellerId": creator_id,

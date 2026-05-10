@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Depends
 from pydantic import BaseModel
 
 from app.core.logger import logger
@@ -79,7 +79,10 @@ async def get_member_plans():
 
 
 @router.post("/subscribe", response_model=SubscribeResponse)
-async def subscribe_member(request: SubscribeRequest):
+async def subscribe_member(
+    request: SubscribeRequest,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     创建会员订阅订单
     
@@ -96,9 +99,10 @@ async def subscribe_member(request: SubscribeRequest):
     if not plan:
         raise HTTPException(status_code=400, detail="无效的套餐ID")
     
-    # 2. 通过 JWT 认证获取用户
-    user_id = get_current_user_id()
-    logger.info(f"[会员订阅] user_id={request.user_id}")
+    # 2. 校验 JWT 用户与请求 user_id 一致
+    if request.user_id and request.user_id != user_id:
+        raise HTTPException(status_code=403, detail="用户身份不匹配")
+    logger.info(f"[会员订阅] user_id={user_id}")
     
     try:
         user = await parse_client.get_user(user_id)
@@ -261,10 +265,12 @@ async def wechat_callback(request_body: str):
 
 
 @router.get("/status/{user_id}", response_model=MemberStatusResponse)
-async def get_member_status(user_id: str):
+async def get_member_status(
+    user_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
     """获取用户会员状态"""
     # 通过 JWT 认证验证用户身份
-    current_user_id = get_current_user_id()
     if current_user_id != user_id:
         raise HTTPException(status_code=403, detail="无权访问此用户信息")
     
@@ -293,10 +299,14 @@ async def get_member_status(user_id: str):
 
 
 @router.get("/orders/{user_id}")
-async def get_member_orders(user_id: str, limit: int = 20, skip: int = 0):
+async def get_member_orders(
+    user_id: str,
+    limit: int = 20,
+    skip: int = 0,
+    current_user_id: str = Depends(get_current_user_id),
+):
     """获取用户会员订单列表"""
     # 通过 JWT 认证验证用户身份
-    current_user_id = get_current_user_id()
     if current_user_id != user_id:
         raise HTTPException(status_code=403, detail="无权访问此用户订单")
     
@@ -312,15 +322,15 @@ async def get_member_orders(user_id: str, limit: int = 20, skip: int = 0):
 
 
 @router.get("/order-status/{order_id}")
-async def get_order_status(order_id: str):
+async def get_order_status(
+    order_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
     """
     查询订单支付状态（用于支付后轮询）
     
     真实支付流程中，前端展示二维码后需要轮询此接口检查支付结果
     """
-    # 通过 JWT 认证
-    current_user_id = get_current_user_id()
-    
     # 查询订单
     result = await parse_client.query_objects(
         "MemberOrder",
@@ -497,7 +507,11 @@ async def complete_member_order(order_id: str, order: dict) -> SubscribeResponse
             new_expire = now + timedelta(days=days)
             logger.info(f"[会员订阅] {'首次开通' if not current_expire else '会员已过期'}，{days}天")
         
-# 6. 更新用户会员状态（使用 Master Key）
+        # 6. 更新用户会员状态（使用 Master Key）
+        update_data = {
+            "memberLevel": new_level,
+            "memberExpireAt": new_expire.isoformat(),
+        }
         try:
             await parse_client.update_user_with_master_key(user_id, update_data)
             logger.info(f"[会员订单] 使用MasterKey更新用户成功")
@@ -507,19 +521,22 @@ async def complete_member_order(order_id: str, order: dict) -> SubscribeResponse
         
         logger.info(f"[会员订阅] 用户 {user_id} 会员等级: {new_level}，到期时间: {new_expire}")
         
-        # 7. 发放积分奖励
-        bonus = plan.get("bonus", 0)
-        if bonus > 0:
+        # 7. 发放积分奖励（按系统 SystemConfig.credits 兑换比例）
+        price = plan.get("price", 0)
+        if price and float(price) > 0:
             try:
                 reward_result = await incentive_service.grant_member_subscribe_reward(
                     user_id=user_id,
                     plan_name=plan.get('name', plan_id),
                     member_level=new_level,
                     order_id=order_id,
-                    bonus=bonus,
+                    price=float(price),
                 )
                 if reward_result.get("success"):
-                    logger.info(f"[会员订阅] 发放积分奖励成功: {user_id}, {bonus}积分")
+                    logger.info(
+                        f"[会员订阅] 按兑换比例发放积分奖励成功: {user_id}, "
+                        f"支付 {price:g} 元 -> 赠送 {reward_result.get('balance_after', 0) - reward_result.get('balance_before', 0):g} 积分"
+                    )
                 else:
                     logger.warning(f"[会员订阅] 发放积分奖励失败: {user_id}, 原因: {reward_result.get('error')}")
             except Exception as e:
