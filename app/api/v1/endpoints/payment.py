@@ -15,6 +15,7 @@ from app.core.security import generate_order_no
 from app.core.deps import get_current_user_id, get_optional_parse_user
 from app.core.config import settings
 from app.core.incentive_service import incentive_service
+from app.core.redis_client import redis_client
 from eth_account import Account
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,37 @@ async def cancel_order(order_id: str):
     return {"success": True, "message": "订单已取消"}
 
 
+# ============ 辅助函数 ============
+
+async def _remove_product_from_user_cart(user_id: Optional[str], product_id: Optional[str]):
+    """订单 completed 后，从该用户购物车 Redis 中移除对应商品条目（幂等，失败不抛出）"""
+    if not user_id or not product_id:
+        return
+    try:
+        import json
+        cart_key = f"cart:{user_id}"
+        cart_data = await redis_client.get(cart_key)
+        if not cart_data:
+            return
+        cart_items = json.loads(cart_data)
+        new_items = [it for it in cart_items if it.get("asset_id") != product_id]
+        if len(new_items) == len(cart_items):
+            return  # 不在购物车，无需更新
+        if new_items:
+            # 保留原 TTL：读取剩余 TTL 后再写入；取不到则默认 7 天
+            try:
+                ttl = await redis_client.client.ttl(cart_key)
+            except Exception:
+                ttl = 0
+            ttl = ttl if (isinstance(ttl, int) and ttl > 0) else 7 * 24 * 3600
+            await redis_client.set(cart_key, json.dumps(new_items), ex=ttl)
+        else:
+            await redis_client.delete(cart_key)
+        logger.info(f"[购物车同步] 已从用户 {user_id} 购物车移除商品 {product_id}")
+    except Exception as e:
+        logger.warning(f"[购物车同步] 移除失败（忽略）: {e}")
+
+
 # ============ Web3转账验证（核心） ============
 
 # 最少确认数（以太坊主网建议6个确认）
@@ -462,7 +494,10 @@ async def verify_web3_transfer(request: VerifyTransferRequest):
             "completedAt": datetime.now(timezone.utc).isoformat()
         })
         logger.info(f"[验证转账] 订单已完成: {request.order_id}, txHash: {request.tx_hash[:16]}...")
-        
+
+        # 订单完成：从买家购物车中清除该商品（幂等）
+        await _remove_product_from_user_cart(order.get("userId"), product_id)
+
         # 11. 发放充值奖励（如果是购买订单）
         try:
             user_id = order.get("userId")
@@ -547,7 +582,10 @@ async def mock_pay_order(order_id: str):
         "status": "completed",
         "txHash": mock_tx_hash
     })
-    
+
+    # 订单完成：从买家购物车中清除该商品（幂等）
+    await _remove_product_from_user_cart(order.get("userId"), product_id)
+
     return {"success": True, "message": "模拟支付成功", "order_id": order_id, "status": "completed"}
 
 
@@ -624,6 +662,9 @@ async def process_pending_paid_orders():
                         "completedAt": datetime.now(timezone.utc).isoformat()
                     })
                     logger.info(f"[后台任务] 订单已完成: {order_id}")
+
+                    # 订单完成：从买家购物车中清除该商品（幂等）
+                    await _remove_product_from_user_cart(order.get("userId"), product_id)
                 
                 elif tx_status == "failed":
                     # 交易失败

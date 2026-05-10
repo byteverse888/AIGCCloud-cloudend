@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from app.core.parse_client import parse_client
 from app.core.email_client import email_client
 from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_user_id
+from app.core.logger import logger
 
 router = APIRouter()
 
@@ -80,24 +81,37 @@ async def review_product(
     except Exception:
         raise HTTPException(status_code=404, detail="商品不存在")
     
+    previous_status = product.get("status")
+    new_status = request.status
+
     # 更新商品状态
+    status_value = new_status.value if hasattr(new_status, 'value') else str(new_status)
     update_data = {
-        "status": request.status,
+        "status": status_value,
         "reviewedAt": datetime.now(timezone.utc).isoformat(),
         "reviewedBy": user_id,
     }
     if request.review_note:
         update_data["reviewNote"] = request.review_note
+    # 驳回 / 强制下架时，同步记录 offlineReason，便于列表显示具体原因
+    if status_value in (ProductStatus.REJECTED.value, ProductStatus.OFFLINE.value):
+        update_data["offlineReason"] = request.review_note or (
+            "已审核商品被驳回下架" if previous_status == ProductStatus.APPROVED.value else "审核驳回"
+        )
     
     await parse_client.update_object("Product", request.product_id, update_data)
     
-    # 创建审核记录
-    await parse_client.create_object("ProductReview", {
-        "productId": request.product_id,
-        "operatorId": user_id,
-        "status": request.status,
-        "note": request.review_note,
-    })
+    # 创建审核记录（审计性写入，失败不影响主流程）
+    try:
+        await parse_client.create_object("ProductReview", {
+            "productId": request.product_id,
+            "operatorId": user_id,
+            "status": new_status.value if hasattr(new_status, 'value') else str(new_status),
+            "note": request.review_note,
+            "previousStatus": previous_status,
+        })
+    except Exception as e:
+        logger.warning(f"[Review] 写入 ProductReview 审核记录失败（忽略）: {e}")
     
     # 发送通知给创作者
     creator_id = product.get("creatorId")
@@ -129,14 +143,46 @@ async def batch_review_products(
     """
     批量审核商品(管理员/运营人员) - 并发执行
     """
+    status_value = request.status.value if hasattr(request.status, 'value') else str(request.status)
+    is_reject_or_offline = status_value in (ProductStatus.REJECTED.value, ProductStatus.OFFLINE.value)
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+
     async def _review_one(product_id: str) -> dict:
         try:
-            await parse_client.update_object("Product", product_id, {
-                "status": request.status,
-                "reviewedAt": datetime.now(timezone.utc).isoformat(),
+            # 获取原状态用于 offlineReason 文案与审计记录
+            prev = None
+            try:
+                existing = await parse_client.get_object("Product", product_id)
+                prev = existing.get("status")
+            except Exception:
+                pass
+
+            update_data = {
+                "status": status_value,
+                "reviewedAt": reviewed_at,
                 "reviewedBy": user_id,
-                "reviewNote": request.review_note,
-            })
+            }
+            if request.review_note:
+                update_data["reviewNote"] = request.review_note
+            if is_reject_or_offline:
+                update_data["offlineReason"] = request.review_note or (
+                    "已审核商品被驳回下架" if prev == ProductStatus.APPROVED.value else "审核驳回"
+                )
+
+            await parse_client.update_object("Product", product_id, update_data)
+
+            # 审计性写入（失败不阻断主流程）
+            try:
+                await parse_client.create_object("ProductReview", {
+                    "productId": product_id,
+                    "operatorId": user_id,
+                    "status": status_value,
+                    "previousStatus": prev,
+                    "note": request.review_note,
+                })
+            except Exception as e:
+                logger.warning(f"[BatchReview] 写入 ProductReview 审核记录失败（忽略）: {e}")
+
             return {"product_id": product_id, "success": True}
         except Exception as e:
             return {"product_id": product_id, "success": False, "error": str(e)}
@@ -206,28 +252,83 @@ async def get_pending_products(
     page: int = 1,
     limit: int = 20,
     category: Optional[str] = None,
+    status: Optional[str] = None,
+    creator_id: Optional[str] = None,
+    keyword: Optional[str] = None,
     user_id: str = Depends(get_operator_user_id)
 ):
     """
-    获取待审核商品列表
+    获取待审核商品列表（兼兼管理员的商品管理列表）
+    - status 为空或 "pending" 时返回待审核
+    - status="all" 时返回全部状态
+    - status="reported" 时返回所有 reportCount > 0 的被投诉商品
+    - 其他值（approved/rejected/draft/offline）按状态筛选
+    - creator_id: 按创建者 userId 精确过滤
+    - keyword: 按商品名称模糊搜索
     """
-    where = {"status": ProductStatus.PENDING}
+    where: dict = {}
+    is_reported_tab = (status == "reported")
+    if is_reported_tab:
+        where["reportCount"] = {"$gt": 0}
+    elif not status or status == "pending":
+        where["status"] = ProductStatus.PENDING
+    elif status != "all":
+        where["status"] = status
     if category:
         where["category"] = category
-    
+    if creator_id:
+        # 支持按 userId 精确 或 用户名 模糊搜索
+        user_kw = creator_id.strip()
+        candidate_ids = {user_kw}
+        try:
+            u_res = await parse_client.query_users(
+                where={"username": {"$regex": user_kw, "$options": "i"}}, limit=50
+            )
+            for u in u_res.get("results", []):
+                if u.get("objectId"):
+                    candidate_ids.add(u["objectId"])
+        except Exception:
+            pass
+        where["creatorId"] = {"$in": list(candidate_ids)} if len(candidate_ids) > 1 else user_kw
+    if keyword and keyword.strip():
+        where["name"] = {"$regex": keyword.strip(), "$options": "i"}
+
     skip = (page - 1) * limit
+    # 待审核升序（先提交先审）；被投诉按投诉数降序；其他状态按创建时间降序
+    if is_reported_tab:
+        order = "-reportCount"
+    else:
+        order = "createdAt" if where.get("status") == ProductStatus.PENDING else "-createdAt"
     result = await parse_client.query_objects(
         "Product",
-        where=where,
-        order="createdAt",  # 按创建时间升序，先提交的先审核
+        where=where if where else None,
+        order=order,
         limit=limit,
         skip=skip
     )
-    
-    total = await parse_client.count_objects("Product", where)
-    
+
+    total = await parse_client.count_objects("Product", where if where else None)
+
+    # 附带创建者用户名（带缓存）
+    products_list = result.get("results", [])
+    creator_cache: dict = {}
+    for p in products_list:
+        cid = p.get("creatorId") or ""
+        if cid and not p.get("creatorName"):
+            if cid in creator_cache:
+                p["creatorName"] = creator_cache[cid]
+            else:
+                try:
+                    u = await parse_client.get_user(cid)
+                    name = u.get("username", "") if u else ""
+                    creator_cache[cid] = name
+                    p["creatorName"] = name
+                except Exception:
+                    creator_cache[cid] = ""
+                    p["creatorName"] = ""
+
     return {
-        "data": result.get("results", []),
+        "data": products_list,
         "total": total,
         "page": page,
         "limit": limit,

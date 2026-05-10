@@ -49,6 +49,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"默认用户初始化失败: {e}")
     
+    # 初始化内置角色（admin/operator/user）
+    try:
+        await parse_client.ensure_default_roles()
+        logger.info("内置角色初始化完成")
+    except Exception as e:
+        logger.error(f"内置角色初始化失败: {e}")
+    
     # 初始化 ARQ 连接池
     try:
         await get_arq_pool()

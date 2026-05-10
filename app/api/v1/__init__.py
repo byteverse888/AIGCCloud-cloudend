@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import users, payment, tasks, incentive, promotion, products, auth, storage, member, admin, assets, operator
+from app.api.v1.endpoints import users, payment, tasks, incentive, promotion, products, auth, storage, member, admin, assets, operator, operation_logs
 
 router = APIRouter()
 
@@ -29,3 +29,6 @@ router.include_router(operator.router, prefix="/operator", tags=["Operator"])
 
 # 管理端
 router.include_router(admin.router, prefix="/admin", tags=["Admin"])
+
+# 操作日志（admin/operator 共用）
+router.include_router(operation_logs.router, prefix="/operation-logs", tags=["OperationLog"])

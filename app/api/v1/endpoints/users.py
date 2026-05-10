@@ -26,6 +26,7 @@ from app.core.security import (
 from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_user_id
 from app.core.config import settings
 from app.core.logger import logger
+from app.core.operation_log import log_operation
 
 router = APIRouter()
 
@@ -618,11 +619,13 @@ class RechargeUserAccountRequest(BaseModel):
 @router.post("/admin/reset-password")
 async def reset_user_password(
     request: ResetUserPasswordRequest,
+    http_request: Request,
     operator_id: str = Depends(get_operator_user_id)
 ):
     """
     重置用户密码（Operator/Admin权限）
     生成随机8位密码或使用指定的密码
+    - operator 只能重置 role=user 的用户密码
     """
     logger.info(f"[User] Operator {operator_id} 正在重置用户 {request.user_id} 的密码")
     
@@ -631,6 +634,14 @@ async def reset_user_password(
         target_user = await parse_client.get_user(request.user_id)
     except Exception:
         raise HTTPException(status_code=404, detail="用户不存在")
+
+    # operator 只能操作普通用户
+    try:
+        me = await parse_client.get_user(operator_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="无法读取操作者信息")
+    if me.get("role") != "admin" and target_user.get("role") != "user":
+        raise HTTPException(status_code=403, detail="运营管理员仅可重置普通用户密码")
     
     # 生成随机密码
     if request.new_password:
@@ -643,6 +654,19 @@ async def reset_user_password(
     await parse_client.update_user_with_master_key(request.user_id, {"password": new_password})
     
     logger.info(f"[User] 用户 {request.user_id} 密码已重置")
+
+    # 记录操作日志
+    await log_operation(
+        operator_id=operator_id,
+        action="reset_password",
+        module="users",
+        target_class="_User",
+        target_id=request.user_id,
+        target_name=target_user.get("username", ""),
+        description=f"重置用户 {target_user.get('username', '')} 的密码",
+        detail={"auto_generated": not bool(request.new_password)},
+        request=http_request,
+    )
     
     return {
         "success": True,
@@ -654,11 +678,13 @@ async def reset_user_password(
 @router.post("/admin/recharge")
 async def recharge_user_account(
     request: RechargeUserAccountRequest,
+    http_request: Request,
     operator_id: str = Depends(get_operator_user_id)
 ):
     """
     为用户充值（Operator/Admin权限）
     在 AccountRecord 中添加充值记录
+    - operator 只能给普通用户充值
     """
     logger.info(f"[User] Operator {operator_id} 正在为用户 {request.user_id} 充值 {request.amount}")
     
@@ -678,37 +704,104 @@ async def recharge_user_account(
     # 获取操作者信息
     operator_user = await parse_client.get_user(operator_id)
     operator_name = operator_user.get("username", "unknown")
+
+    # operator 只能给普通用户充值
+    if operator_user.get("role") != "admin" and target_user.get("role") != "user":
+        raise HTTPException(status_code=403, detail="运营管理员仅可给普通用户充值")
     
-    # 获取用户当前余额
-    web3_address = target_user.get("web3Address")
-    current_balance = 0
-    if web3_address:
-        try:
-            current_balance = await web3_client.get_balance(web3_address)
-        except Exception:
-            pass
-    
-    # 创建账户充值记录
+    # 获取用户当前余额（_User.coins 字段才是真实余额，web3 链上余额仅作辅助）
+    current_balance = float(target_user.get("coins", 0) or 0)
+    new_balance = current_balance + float(request.amount)
+
+    # 先更新 _User.coins，确保用户余额真正增加（使用 Master Key）
+    try:
+        await parse_client.update_user_with_master_key(
+            request.user_id, {"coins": new_balance}
+        )
+    except Exception as e:
+        logger.error(f"[User] 更新用户余额失败: {e}", exc_info=True)
+        await log_operation(
+            operator_id=operator_id,
+            action="recharge",
+            module="users",
+            target_class="_User",
+            target_id=request.user_id,
+            target_name=target_user.get("username", ""),
+            description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 失败（更新余额异常）",
+            status="failed",
+            error_message=str(e),
+            detail={"amount": float(request.amount)},
+            request=http_request,
+            operator_name=operator_name,
+            operator_role=operator_user.get("role", ""),
+        )
+        raise HTTPException(status_code=500, detail=f"更新用户余额失败: {e}")
+
+    # 创建账户充值流水记录（createdAt 由 Parse Server 自动管理，不得手动传入）
     record_data = {
         "userId": request.user_id,
-        "amount": request.amount,
+        "username": target_user.get("username", ""),
+        "amount": float(request.amount),
         "type": "recharge",
+        "category": "admin_recharge",
         "balance_before": current_balance,
-        "balance_after": current_balance + request.amount,
+        "balance_after": new_balance,
+        "balance": new_balance,
+        "description": f"管理员({operator_name})为用户 {target_user.get('username', '')} 充值 {request.amount} 金币",
         "operator_id": operator_id,
         "operator_name": operator_name,
-        "createdAt": datetime.now(timezone.utc).isoformat(),
     }
-    
-    result = await parse_client.create_object("AccountRecord", record_data)
-    
+
+    try:
+        result = await parse_client.create_object("AccountRecord", record_data)
+    except Exception as e:
+        logger.error(f"[User] 创建充值记录失败: {e}", exc_info=True)
+        await log_operation(
+            operator_id=operator_id,
+            action="recharge",
+            module="users",
+            target_class="_User",
+            target_id=request.user_id,
+            target_name=target_user.get("username", ""),
+            description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 失败",
+            status="failed",
+            error_message=str(e),
+            detail={"amount": float(request.amount)},
+            request=http_request,
+            operator_name=operator_name,
+            operator_role=operator_user.get("role", ""),
+        )
+        raise HTTPException(status_code=500, detail=f"创建充值记录失败: {e}")
+
     logger.info(f"[User] 用户 {request.user_id} 充值成功: +{request.amount}, 操作者: {operator_name}")
-    
+
+    # 记录操作日志
+    await log_operation(
+        operator_id=operator_id,
+        action="recharge",
+        module="users",
+        target_class="_User",
+        target_id=request.user_id,
+        target_name=target_user.get("username", ""),
+        description=f"为用户 {target_user.get('username', '')} 充值 {request.amount} 金币，余额 {current_balance} → {new_balance}",
+        detail={
+            "amount": float(request.amount),
+            "target_user_id": request.user_id,
+            "target_username": target_user.get("username", ""),
+            "balance_before": current_balance,
+            "balance_after": new_balance,
+            "record_id": result.get("objectId"),
+        },
+        request=http_request,
+        operator_name=operator_name,
+        operator_role=operator_user.get("role", ""),
+    )
+
     return {
         "success": True,
         "message": "充值成功",
         "amount": request.amount,
-        "new_balance": current_balance + request.amount,
+        "new_balance": new_balance,
         "record_id": result.get("objectId")
     }
 
@@ -718,17 +811,33 @@ class UpdateUserRequest(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     level: Optional[int] = None
+    status: Optional[str] = None  # active / inactive / banned
 
 
 @router.put("/admin/update")
 async def update_user(
     request: UpdateUserRequest,
-    admin_id: str = Depends(get_admin_user_id)
+    http_request: Request,
+    operator_id: str = Depends(get_operator_user_id)
 ):
     """
-    更新用户信息（Admin权限）
+    更新用户信息（Operator/Admin 权限）
+    - operator 只能编辑 role=user 的用户
+    - admin 不受此限制
     """
-    logger.info(f"[User] Admin {admin_id} 正在更新用户 {request.user_id} 的信息")
+    logger.info(f"[User] Operator {operator_id} 正在更新用户 {request.user_id} 的信息")
+
+    # 权限降级检查
+    try:
+        me = await parse_client.get_user(operator_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="无法读取操作者信息")
+    try:
+        target_user = await parse_client.get_user(request.user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if me.get("role") != "admin" and target_user.get("role") != "user":
+        raise HTTPException(status_code=403, detail="运营管理员仅可编辑普通用户")
     
     # 构建更新数据
     update_data = {}
@@ -738,6 +847,10 @@ async def update_user(
         update_data["phone"] = request.phone
     if request.level is not None:
         update_data["level"] = request.level
+    if request.status is not None:
+        if request.status not in ("active", "inactive", "banned"):
+            raise HTTPException(status_code=400, detail="status 只能为 active/inactive/banned")
+        update_data["status"] = request.status
     
     if not update_data:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
@@ -747,9 +860,45 @@ async def update_user(
         await parse_client.update_user_with_master_key(request.user_id, update_data)
     except Exception as e:
         logger.error(f"[User] 更新用户失败: {str(e)}")
+        await log_operation(
+            operator_id=operator_id,
+            action="update",
+            module="users",
+            target_class="_User",
+            target_id=request.user_id,
+            target_name=target_user.get("username", ""),
+            description=f"更新用户 {target_user.get('username', '')} 失败",
+            status="failed",
+            error_message=str(e),
+            detail=update_data,
+            request=http_request,
+        )
         raise HTTPException(status_code=404, detail="用户不存在")
     
     logger.info(f"[User] 用户 {request.user_id} 信息已更新")
+
+    # 区分 action（封禁/解封 或 普通更新）
+    if update_data.get("status") == "banned":
+        action = "ban"
+        description = f"封禁用户 {target_user.get('username', '')}"
+    elif update_data.get("status") == "active" and target_user.get("status") == "banned":
+        action = "unban"
+        description = f"解封用户 {target_user.get('username', '')}"
+    else:
+        action = "update"
+        description = f"更新用户 {target_user.get('username', '')} 信息"
+
+    await log_operation(
+        operator_id=operator_id,
+        action=action,
+        module="users",
+        target_class="_User",
+        target_id=request.user_id,
+        target_name=target_user.get("username", ""),
+        description=description,
+        detail=update_data,
+        request=http_request,
+    )
     
     return {
         "success": True,
@@ -760,17 +909,13 @@ async def update_user(
 @router.post("/admin/create")
 async def create_user(
     request: dict,
-    admin_id: str = Depends(get_admin_user_id)
+    http_request: Request,
+    operator_id: str = Depends(get_operator_user_id)
 ):
     """
-    管理员创建新用户
-    - 用户名必填，3-20字符
-    - 密码必填，最少6位
-    - 邮箱选填，格式验证
-    - 手机号选填，格式验证
-    - 角色必填，默认 user，可选 user/operator
-    - 等级默认值1
-    - 创建后 status="inactive"
+    管理/运营创建新用户
+    - admin 可创建任意角色（user/operator/admin）
+    - operator 仅可创建 role=user
     """
     username = request.get("username", "").strip()
     password = request.get("password", "").strip()
@@ -778,6 +923,16 @@ async def create_user(
     phone = request.get("phone", "").strip() or None
     role = request.get("role", "user")
     level = request.get("level", 1)
+    active = request.get("active", True)  # 默认激活
+
+    # 权限降级：operator 强制 role=user
+    try:
+        me = await parse_client.get_user(operator_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="无法读取操作者信息")
+    if me.get("role") != "admin":
+        if role != "user":
+            raise HTTPException(status_code=403, detail="运营管理员仅可创建普通用户")
 
     # 验证用户名
     if not username or len(username) < 3 or len(username) > 20:
@@ -788,8 +943,8 @@ async def create_user(
         raise HTTPException(status_code=400, detail="密码至少6位")
 
     # 验证角色
-    if role not in ("user", "operator"):
-        raise HTTPException(status_code=400, detail="角色只能是 user 或 operator")
+    if role not in ("user", "operator", "admin"):
+        raise HTTPException(status_code=400, detail="角色只能是 user、operator 或 admin")
 
     # 检查用户名是否已存在
     existing = await parse_client.query_users(where={"username": username})
@@ -798,13 +953,13 @@ async def create_user(
 
     # 创建用户
     try:
-        # 设置默认 status 为 inactive
         user_data = {
             "username": username,
-            "password": password,  # Parse 会自动加密
+            "password": password,
             "role": role,
             "level": level,
-            "status": "inactive",  # 需要管理员手动启用
+            "status": "active" if active else "inactive",
+            "emailVerified": True if active else False,
         }
         if email:
             user_data["email"] = email
@@ -812,14 +967,41 @@ async def create_user(
             user_data["phone"] = phone
 
         result = await parse_client.create_user(user_data)
+        new_user_id = result.get("objectId", "")
+
+        await log_operation(
+            operator_id=operator_id,
+            action="create",
+            module="users",
+            target_class="_User",
+            target_id=new_user_id,
+            target_name=username,
+            description=f"创建用户 {username} (role={role})",
+            detail={"username": username, "role": role, "level": level, "active": active, "email": email, "phone": phone},
+            request=http_request,
+        )
 
         return {
             "success": True,
-            "user_id": result.get("objectId", ""),
-            "objectId": result.get("objectId", "")
+            "user_id": new_user_id,
+            "objectId": new_user_id,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[Admin] 创建用户失败: {e}")
+        await log_operation(
+            operator_id=operator_id,
+            action="create",
+            module="users",
+            target_class="_User",
+            target_name=username,
+            description=f"创建用户 {username} 失败",
+            status="failed",
+            error_message=str(e),
+            detail={"username": username, "role": role},
+            request=http_request,
+        )
         raise HTTPException(status_code=500, detail="创建失败，请重试")
 
 
@@ -828,13 +1010,23 @@ async def list_users(
     page: int = 1,
     limit: int = 20,
     role: Optional[str] = None,
-    admin_id: str = Depends(get_admin_user_id)
+    operator_id: str = Depends(get_operator_user_id)
 ):
     """
-    获取用户列表(管理员)
+    获取用户列表（Operator/Admin）
+    - operator 强制 role=user，仅可查看普通用户
+    - admin 不受限制
     """
+    try:
+        me = await parse_client.get_user(operator_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="无法读取操作者信息")
+
     where = {}
-    if role:
+    if me.get("role") != "admin":
+        # 运营管理员只能看普通用户
+        where["role"] = "user"
+    elif role:
         where["role"] = role
     
     skip = (page - 1) * limit
@@ -845,7 +1037,7 @@ async def list_users(
         skip=skip
     )
     
-    total = await parse_client.count_objects("_User", where if where else None)
+    total = await parse_client.count_users(where if where else None)
     
     return {
         "data": result.get("results", []),

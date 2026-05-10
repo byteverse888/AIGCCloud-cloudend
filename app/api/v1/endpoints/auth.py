@@ -25,6 +25,8 @@ from app.core.security import (
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.rate_limit import login_rate_limit, register_rate_limit, sms_rate_limit
+from app.core.operation_log import log_operation
+from app.core.deps import get_current_user_id
 
 router = APIRouter()
 
@@ -34,6 +36,8 @@ router = APIRouter()
 class LoginRequest(BaseModel):
     username: str
     password: str
+    captcha_id: Optional[str] = None
+    captcha_text: Optional[str] = None
 
 
 class PhoneLoginRequest(BaseModel):
@@ -56,6 +60,8 @@ class EmailLoginRequest(BaseModel):
     """邮箱登录请求"""
     email: str
     password: str
+    captcha_id: Optional[str] = None
+    captcha_text: Optional[str] = None
 
 
 class Web3InitRequest(BaseModel):
@@ -95,6 +101,103 @@ class ParseConfigResponse(BaseModel):
 
 # ============ 端点 ============
 
+@router.get("/public-config")
+async def get_public_config():
+    """
+    对外公开的站点配置（登录页/侧栏/页脚等使用）
+    不需要鉴权。返回站点名称、Logo、备案、页脚、以及登录验证码开关等。
+    敏感字段（如支付密钥、SMTP密码）不返回。
+    """
+    default_config = {
+        "siteName": "巴特星球",
+        "productName": "巴特星球",
+        "slogan": "",
+        "siteUrl": "",
+        "contactEmail": "",
+        "contactPhone": "",
+        "supportEmail": "",
+        "companyName": "",
+        "companyAddress": "",
+        "icp": "",
+        "policeICP": "",
+        "businessLicense": "",
+        "otherLicense": "",
+        "footerText": "",
+        "footerCopyright": "",
+        "friendLinks": "",
+        "lightLogo": "",
+        "darkLogo": "",
+        "favicon": "",
+        "loginBg": "",
+        "loginCaptcha": False,
+    }
+    try:
+        result = await parse_client.query_objects("SystemConfig", limit=100)
+        configs: dict = {}
+        for item in result.get("results", []):
+            cat = item.get("category", "")
+            if cat:
+                configs[cat] = item.get("settings", {}) or {}
+
+        general = configs.get("general", {}) or {}
+        logo = configs.get("logo", {}) or {}
+        security = configs.get("security", {}) or {}
+
+        merged = {
+            "siteName": general.get("siteName") or default_config["siteName"],
+            "productName": logo.get("productName") or general.get("siteName") or default_config["productName"],
+            "slogan": logo.get("slogan") or "",
+            "siteUrl": general.get("siteUrl") or "",
+            "contactEmail": general.get("contactEmail") or "",
+            "contactPhone": logo.get("contactPhone") or general.get("contactPhone") or "",
+            "supportEmail": logo.get("supportEmail") or "",
+            "companyName": logo.get("companyName") or "",
+            "companyAddress": logo.get("companyAddress") or "",
+            "icp": logo.get("icp") or general.get("icp") or "",
+            "policeICP": logo.get("policeICP") or "",
+            "businessLicense": logo.get("businessLicense") or "",
+            "otherLicense": logo.get("otherLicense") or "",
+            "footerText": logo.get("footerText") or "",
+            "footerCopyright": logo.get("footerCopyright") or "",
+            "friendLinks": logo.get("friendLinks") or "",
+            "lightLogo": logo.get("lightLogo") or "",
+            "darkLogo": logo.get("darkLogo") or "",
+            "favicon": logo.get("favicon") or "",
+            "loginBg": logo.get("loginBg") or "",
+            "loginCaptcha": bool(security.get("loginCaptcha", False)),
+        }
+        return {"success": True, "data": merged}
+    except Exception as e:
+        logger.warning(f"[public-config] 获取系统配置失败，返回默认值: {e}")
+        return {"success": True, "data": default_config}
+
+
+async def _is_login_captcha_enabled() -> bool:
+    """读取 SystemConfig 中 security.loginCaptcha 开关"""
+    try:
+        existing = await parse_client.query_objects(
+            "SystemConfig", where={"category": "security"}, limit=1
+        )
+        results = existing.get("results", [])
+        if results:
+            settings = results[0].get("settings", {}) or {}
+            return bool(settings.get("loginCaptcha", False))
+    except Exception as e:
+        logger.warning(f"[Auth] 读取 loginCaptcha 开关失败: {e}")
+    return False
+
+
+async def _verify_login_captcha_if_enabled(captcha_id: Optional[str], captcha_text: Optional[str]) -> None:
+    """如果后台开启了登录验证码，则必须校验验证码。未开启直接放行。"""
+    if not await _is_login_captcha_enabled():
+        return
+    if not captcha_id or not captcha_text:
+        raise HTTPException(status_code=400, detail="请输入图形验证码")
+    ok = await captcha_service.verify(captcha_id, captcha_text)
+    if not ok:
+        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+
+
 @router.get("/captcha")
 async def get_captcha():
     """
@@ -113,13 +216,15 @@ async def get_captcha():
 
 
 @router.post("/login", response_model=LoginResponse, dependencies=[Depends(login_rate_limit)])
-async def login(request: LoginRequest):
+async def login(request: LoginRequest, http_request: Request):
     """
     用户登录
     - 验证用户名密码
     - 返回JWT Token和Parse配置
     """
     logger.info(f"[登录] 用户尝试登录: {request.username}")
+    # 根据开关条件性校验图形验证码
+    await _verify_login_captcha_if_enabled(request.captcha_id, request.captcha_text)
     try:
         # 通过Parse验证登录
         try:
@@ -176,6 +281,22 @@ async def login(request: LoginRequest):
         }
         
         logger.info(f"[登录] 登录成功: {request.username} (ID: {user_id})")
+
+        # 记录登录操作日志
+        await log_operation(
+            operator_id=user_id or "",
+            action="login",
+            module="auth",
+            target_class="_User",
+            target_id=user_id or "",
+            target_name=user_data.get("username", ""),
+            description=f"用户名密码登录",
+            detail={"method": "username_password"},
+            request=http_request,
+            operator_name=user_data.get("username", ""),
+            operator_role=user_data.get("role", "user"),
+        )
+
         return LoginResponse(
             success=True,
             token=jwt_token,
@@ -464,7 +585,9 @@ async def email_login(request: EmailLoginRequest):
     2. 生成 JWT
     """
     logger.info(f"[Auth] 邮箱登录请求: {request.email}")
-    
+    # 根据开关条件性校验图形验证码
+    await _verify_login_captcha_if_enabled(request.captcha_id, request.captcha_text)
+
     try:
         user_data = await parse_client.login_user(request.email, request.password)
     except httpx.HTTPStatusError:
@@ -503,13 +626,14 @@ async def email_login(request: EmailLoginRequest):
 
 @router.post("/logout")
 async def logout(
-    token: str = Depends(verify_jwt_token),
+    http_request: Request,
+    user_id: str = Depends(get_current_user_id),
     parse_session: Optional[str] = Header(None, alias="X-Parse-Session-Token")
 ):
     """
     用户登出
     """
-    if not token:
+    if not user_id:
         raise HTTPException(status_code=401, detail="未登录")
     
     # 清除 Parse session
@@ -520,8 +644,26 @@ async def logout(
         else:
             logger.warning(f"[Auth] Parse session 清除失败")
     
-    # 可以将token加入黑名单（Redis）
-    # await redis_client.set(f"blacklist:{token}", "1", ex=86400)
+    # 记录登出操作日志
+    try:
+        u = await parse_client.get_user(user_id)
+        username = u.get("username", "")
+        role = u.get("role", "user")
+    except Exception:
+        username = ""
+        role = ""
+    await log_operation(
+        operator_id=user_id,
+        action="logout",
+        module="auth",
+        target_class="_User",
+        target_id=user_id,
+        target_name=username,
+        description="用户登出",
+        request=http_request,
+        operator_name=username,
+        operator_role=role,
+    )
     
     return {"success": True, "message": "登出成功"}
 

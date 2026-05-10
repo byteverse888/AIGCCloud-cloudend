@@ -19,9 +19,10 @@ async def get_orders(
     limit: int = 20,
     status: Optional[str] = None,
     search: Optional[str] = None,
+    buyer_user_id: Optional[str] = None,
     operator_id: str = Depends(get_operator_user_id)
 ):
-    """获取订单列表（运营人员）"""
+    """获取订单列表（运营人员，支持按购买者 userId 过滤）"""
     where = {}
     if status:
         where["status"] = status
@@ -30,6 +31,20 @@ async def get_orders(
             {"orderNo": {"$regex": search, "$options": "i"}},
             {"userId": {"$regex": search, "$options": "i"}},
         ]
+    if buyer_user_id:
+        # 支持按 userId 精确 或 用户名 模糊搜索
+        user_kw = buyer_user_id.strip()
+        candidate_ids = {user_kw}
+        try:
+            u_res = await parse_client.query_users(
+                where={"username": {"$regex": user_kw, "$options": "i"}}, limit=50
+            )
+            for u in u_res.get("results", []):
+                if u.get("objectId"):
+                    candidate_ids.add(u["objectId"])
+        except Exception:
+            pass
+        where["userId"] = {"$in": list(candidate_ids)} if len(candidate_ids) > 1 else user_kw
     
     skip = (page - 1) * limit
     result = await parse_client.query_objects(

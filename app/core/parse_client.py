@@ -336,8 +336,30 @@ class ParseClient:
             logger.error(f"[Parse] 更新用户异常: {e}")
             raise
     
+    async def count_users(self, where: Optional[Dict] = None) -> int:
+        """
+        统计 _User 类的用户数（必须用 Master Key）
+        Parse Server 对 _User 类的普通 REST API Key 请求受 ACL/CLP 限制，
+        会导致 count 返回 0，故这里必须显式使用 Master Key。
+        """
+        import json
+        params = {"count": "1", "limit": "0"}
+        if where:
+            params["where"] = json.dumps(where)
+        url = f"{self.base_url}/classes/_User"
+        client = await self._get_master_client()
+        try:
+            response = await client.get(url, params=params)
+            if response.status_code >= 400:
+                logger.error(f"[Parse] count_users 失败: {response.text}")
+                response.raise_for_status()
+            return response.json().get("count", 0)
+        except Exception as e:
+            logger.error(f"[Parse] count_users 异常: {e}")
+            raise
+
     async def query_users(
-        self, 
+        self,
         where: Optional[Dict] = None,
         order: Optional[str] = None,
         limit: int = 100,
@@ -436,6 +458,23 @@ class ParseClient:
             "offlineReason": {"type": "String"},
             "copyright": {"type": "String"},
             "license": {"type": "String"},
+        },
+        "ProductReview": {
+            "productId": {"type": "String"},
+            "operatorId": {"type": "String"},
+            "status": {"type": "String"},
+            "previousStatus": {"type": "String"},
+            "note": {"type": "String"},
+        },
+        "ProductReport": {
+            "productId": {"type": "String"},
+            "reporterId": {"type": "String"},
+            "reason": {"type": "String"},
+            "description": {"type": "String"},
+            "status": {"type": "String"},
+            "handledAt": {"type": "String"},
+            "handledBy": {"type": "String"},
+            "action": {"type": "String"},
         },
         "MemberOrder": {
             "orderId": {"type": "String"},
@@ -553,10 +592,16 @@ class ParseClient:
             "mockOwner": {"type": "String"},
             "views": {"type": "Number"},
             "isListed": {"type": "Boolean"},
+            "listedProductId": {"type": "String"},
             "tags": {"type": "Array"},
             "copyright": {"type": "String"},
             "license": {"type": "String"},
             "assetUrl": {"type": "String"},
+            # 审核相关（用于展示驳回/下架原因与审核记录）
+            "reviewedAt": {"type": "String"},
+            "reviewedBy": {"type": "String"},
+            "reviewNote": {"type": "String"},
+            "offlineReason": {"type": "String"},
         },
         # 评论
         "Comment": {
@@ -660,10 +705,12 @@ class ParseClient:
             "relatedOrderNo": {"type": "String"},
             "operator_id": {"type": "String"},
             "operator_name": {"type": "String"},
-            "createdAt": {"type": "String"},
         },
         # 系统配置
         "SystemConfig": {
+            "category": {"type": "String"},
+            "settings": {"type": "Object"},
+            "updatedBy": {"type": "String"},
             "key": {"type": "String"},
             "value": {"type": "String"},
             "label": {"type": "String"},
@@ -676,6 +723,23 @@ class ParseClient:
             "reason": {"type": "String"},
             "description": {"type": "String"},
             "status": {"type": "String"},
+        },
+        # 管理/运营操作日志（登录登出、用户增删改、充值等）
+        "OperationLog": {
+            "operatorId": {"type": "String"},
+            "operatorName": {"type": "String"},
+            "operatorRole": {"type": "String"},
+            "action": {"type": "String"},
+            "module": {"type": "String"},
+            "targetClass": {"type": "String"},
+            "targetId": {"type": "String"},
+            "targetName": {"type": "String"},
+            "description": {"type": "String"},
+            "detail": {"type": "Object"},
+            "ipAddress": {"type": "String"},
+            "userAgent": {"type": "String"},
+            "status": {"type": "String"},
+            "errorMessage": {"type": "String"},
         },
     }
     
@@ -825,27 +889,46 @@ class ParseClient:
         default_users = [
             {"username": "admin", "password": "Admin@123456", "email": "admin@aigccloud.com", "role": "admin", "level": 99, "emailVerified": True},
             {"username": "operator", "password": "Operator@123456", "email": "operator@aigccloud.com", "role": "operator", "level": 50, "emailVerified": True},
+            {"username": "testuser", "password": "Test@123456", "email": "testuser@aigccloud.com", "role": "user", "level": 1, "emailVerified": True},
         ]
         client = await self._get_master_client()
         for user_data in default_users:
             try:
-                # 检查用户是否已存在
-                resp = await client.get(
-                    f"{self.base_url}/users",
-                    params={"where": f'{{"username":"{user_data["username"]}"}}', "limit": "1"},
-                )
-                results = resp.json().get("results", [])
-                if results:
-                    # 已存在，确保 role 正确
-                    existing = results[0]
+                # 检查用户是否已存在（分别按 username 和 email 查，PostgreSQL 不支持 $or）
+                import json as _json
+                existing = None
+                for field in ("username", "email"):
+                    value = user_data.get("username") if field == "username" else user_data.get("email")
+                    resp = await client.get(
+                        f"{self.base_url}/users",
+                        params={"where": _json.dumps({field: value}), "limit": "1"},
+                    )
+                    results = resp.json().get("results", [])
+                    if results:
+                        existing = results[0]
+                        break
+                if existing:
+                    # 已存在：校正 username / role / level / password，确保文档化的登录凭证始终有效
+                    patch: dict = {}
+                    if existing.get("username") != user_data["username"]:
+                        patch["username"] = user_data["username"]
+                    if existing.get("email") != user_data["email"]:
+                        patch["email"] = user_data["email"]
                     if existing.get("role") != user_data["role"]:
+                        patch["role"] = user_data["role"]
+                    if existing.get("level") != user_data["level"]:
+                        patch["level"] = user_data["level"]
+                    # 总是重置默认密码，保证与 README 一致
+                    patch["password"] = user_data["password"]
+                    patch["emailVerified"] = True
+                    try:
                         await client.put(
                             f"{self.base_url}/users/{existing['objectId']}",
-                            json={"role": user_data["role"], "level": user_data["level"]},
+                            json=patch,
                         )
-                        logger.info(f"[Parse] 更新用户角色: {user_data['username']} -> {user_data['role']}")
-                    else:
-                        logger.debug(f"[Parse] 默认用户已存在: {user_data['username']}")
+                        logger.info(f"[Parse] 校正默认用户: {user_data['username']} (role={user_data['role']})")
+                    except Exception as ue:
+                        logger.error(f"[Parse] 更新默认用户失败 {user_data['username']}: {ue}")
                 else:
                     # 创建用户
                     create_resp = await client.post(
@@ -858,6 +941,81 @@ class ParseClient:
                         logger.error(f"[Parse] 创建用户失败: {user_data['username']} - {create_resp.text}")
             except Exception as e:
                 logger.error(f"[Parse] 创建默认用户异常({user_data['username']}): {e}")
+
+    async def ensure_default_roles(self):
+        """确保内置角色存在：admin / operator / user"""
+        default_roles = [
+            {
+                "name": "admin",
+                "label": "管理员",
+                "description": "拥有系统全部权限",
+                "permissions": ["*"],
+            },
+            {
+                "name": "operator",
+                "label": "运营管理员",
+                "description": "商品审批、券码促销、充值、报表查看",
+                "permissions": [
+                    "products.review",
+                    "products.manage",
+                    "orders.manage",
+                    "coupons",
+                    "promotions",
+                    "recharge",
+                    "statistics",
+                ],
+            },
+            {
+                "name": "user",
+                "label": "普通用户",
+                "description": "基础用户功能",
+                "permissions": ["user.basic"],
+            },
+        ]
+        client = await self._get_master_client()
+        import json as _json
+        for role_data in default_roles:
+            try:
+                resp = await client.get(
+                    f"{self.base_url}/classes/_Role",
+                    params={"where": _json.dumps({"name": role_data["name"]}), "limit": "1"},
+                )
+                results = resp.json().get("results", [])
+                if results:
+                    existing = results[0]
+                    # 按需补齐 label/description/permissions（不覆盖管理员已改的权限）
+                    patch = {}
+                    if not existing.get("label"):
+                        patch["label"] = role_data["label"]
+                    if not existing.get("description"):
+                        patch["description"] = role_data["description"]
+                    if not existing.get("permissions"):
+                        patch["permissions"] = role_data["permissions"]
+                    if patch:
+                        await client.put(
+                            f"{self.base_url}/classes/_Role/{existing['objectId']}",
+                            json=patch,
+                        )
+                        logger.info(f"[Parse] 补齐内置角色字段: {role_data['name']}")
+                    else:
+                        logger.debug(f"[Parse] 内置角色已存在: {role_data['name']}")
+                else:
+                    create_resp = await client.post(
+                        f"{self.base_url}/classes/_Role",
+                        json={
+                            "name": role_data["name"],
+                            "label": role_data["label"],
+                            "description": role_data["description"],
+                            "permissions": role_data["permissions"],
+                            "ACL": {"*": {"read": True}},
+                        },
+                    )
+                    if create_resp.status_code in (200, 201):
+                        logger.info(f"[Parse] 创建内置角色成功: {role_data['name']}")
+                    else:
+                        logger.error(f"[Parse] 创建内置角色失败: {role_data['name']} - {create_resp.text}")
+            except Exception as e:
+                logger.error(f"[Parse] 创建内置角色异常({role_data['name']}): {e}")
 
 
 # 全局单例

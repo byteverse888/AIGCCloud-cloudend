@@ -15,6 +15,7 @@ from app.core.parse_client import parse_client
 from app.core.web3_client import web3_client
 from app.core.security import generate_task_id
 from app.core.deps import get_current_user_id
+from app.core.deps import get_admin_user_id, get_operator_user_id
 from app.core.config import settings
 from app.core.incentive_service import incentive_service
 from app.core.logger import logger
@@ -267,6 +268,99 @@ async def get_user_tasks(
         "page": page,
         "limit": limit,
     }
+
+
+@router.get("/admin/list")
+async def get_admin_tasks(
+    page: int = 1,
+    limit: int = 20,
+    type: Optional[str] = None,
+    status: Optional[int] = None,
+    designer: Optional[str] = None,
+    user_id: str = Depends(get_operator_user_id),
+):
+    """管理员/运营查看全部 AI 任务列表（支持按提交者 designer userId 过滤）"""
+    where: dict = {}
+    if type:
+        where["type"] = type
+    if status is not None:
+        where["status"] = status
+    if designer:
+        # 支持按 userId 精确 或 用户名 模糊搜索
+        user_kw = designer.strip()
+        candidate_ids = {user_kw}
+        try:
+            u_res = await parse_client.query_users(
+                where={"username": {"$regex": user_kw, "$options": "i"}}, limit=50
+            )
+            for u in u_res.get("results", []):
+                if u.get("objectId"):
+                    candidate_ids.add(u["objectId"])
+        except Exception:
+            pass
+        where["designer"] = {"$in": list(candidate_ids)} if len(candidate_ids) > 1 else user_kw
+
+    skip = (page - 1) * limit
+    result = await parse_client.query_objects(
+        "AITask",
+        where=where if where else None,
+        order="-createdAt",
+        limit=limit,
+        skip=skip,
+    )
+    total = await parse_client.count_objects("AITask", where if where else None)
+
+    tasks = []
+    for task in result.get("results", []):
+        # 附带提交人用户名
+        designer_id = task.get("designer", "")
+        username = ""
+        if designer_id:
+            try:
+                u = await parse_client.get_user(designer_id)
+                username = u.get("username", "")
+            except Exception:
+                pass
+        tasks.append({
+            "objectId": task.get("objectId"),
+            "task_id": task.get("taskId"),
+            "type": task.get("type"),
+            "model": task.get("model"),
+            "status": task.get("status"),
+            "designer": designer_id,
+            "username": username,
+            "results": task.get("results"),
+            "errorMessage": task.get("errorMessage"),
+            "data": task.get("data") or {},
+            "cost": task.get("cost") or 0,
+            "created_at": task.get("createdAt"),
+            "updated_at": task.get("updatedAt"),
+        })
+
+    return {
+        "data": tasks,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
+@router.delete("/admin/{task_object_id}")
+async def admin_delete_task(
+    task_object_id: str,
+    user_id: str = Depends(get_operator_user_id),
+):
+    """管理员/运营删除 AI 任务（不限制状态）"""
+    try:
+        task = await parse_client.get_object("AITask", task_object_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        await parse_client.delete_object("AITask", task_object_id)
+    except Exception as e:
+        logger.error(f"[AdminTasks] 删除任务失败 task_object_id={task_object_id}: {e}")
+        raise HTTPException(status_code=500, detail="删除失败")
+    return {"success": True, "task_id": task.get("taskId")}
 
 
 @router.post("/{task_object_id}/update-status")

@@ -1,16 +1,18 @@
 """
 AI资产发布与购买接口
 """
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone
 import uuid
 
 from app.core.parse_client import parse_client
-from app.core.deps import get_current_user_id
+from app.core.redis_client import redis_client
+from app.core.deps import get_current_user_id, get_operator_user_id
 from app.core.security import generate_order_no
 from app.core.logger import logger
+from app.core.operation_log import log_operation
 
 router = APIRouter()
 
@@ -110,6 +112,10 @@ async def get_my_assets(
             "sales": item.get("sales", 0),
             "coverKey": item.get("coverKey"),
             "createdAt": item.get("createdAt"),
+            # 审核相关字段：用于展示驳回/下架原因
+            "reviewNote": item.get("reviewNote"),
+            "offlineReason": item.get("offlineReason"),
+            "reviewedAt": item.get("reviewedAt"),
         })
     
     return {"data": assets, "total": total, "page": page, "limit": limit}
@@ -340,11 +346,130 @@ async def purchase_asset(asset_id: str, user_id: str = Depends(get_current_user_
     }
 
 
+@router.post("/{asset_id}/purchase-with-balance")
+async def purchase_asset_with_balance(
+    asset_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    使用用户积分余额（totalIncentive）购买商品。
+    - 校验商品存在且 approved
+    - 校验非自己的商品
+    - 校验之前未完成过该商品的购买
+    - 校验余额充足
+    - 原子扣卖家 / 增买家、Product.sales+1、创建 completed 订单
+    - 同步从购物车移除
+    """
+    # 1. 商品校验
+    try:
+        asset = await parse_client.get_object("Product", asset_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="商品不存在")
+
+    if asset.get("status") != "approved":
+        raise HTTPException(status_code=400, detail="该商品暂不可购买")
+
+    creator_id = asset.get("creatorId")
+    if creator_id == user_id:
+        raise HTTPException(status_code=400, detail="不能购买自己的商品")
+
+    # 2. 重复购买校验
+    existing = await parse_client.query_objects(
+        "Order",
+        where={"userId": user_id, "productId": asset_id, "status": "completed"}
+    )
+    if existing.get("results"):
+        raise HTTPException(status_code=400, detail="您已购买过该商品")
+
+    price = float(asset.get("price", 0) or 0)
+
+    # 3. 余额校验（免费商品直接通过）
+    try:
+        buyer = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    balance = float(buyer.get("totalIncentive", 0) or 0)
+    if price > 0 and balance < price:
+        raise HTTPException(status_code=400, detail=f"积分余额不足，需要 {price:g} 积分，当前 {balance:g}")
+
+    # 4. 扣买家、增卖家
+    if price > 0:
+        try:
+            await parse_client.update_user(user_id, {
+                "totalIncentive": parse_client.increment(-price)
+            })
+        except Exception as e:
+            logger.error(f"[积分支付] 扣减买家余额失败: {e}")
+            raise HTTPException(status_code=500, detail="扣减余额失败")
+        if creator_id:
+            try:
+                await parse_client.update_user(creator_id, {
+                    "totalIncentive": parse_client.increment(price)
+                })
+            except Exception as e:
+                # 卖家入账失败仅告警，不回滚买家扣费（如需昵蛋可后续补偷）
+                logger.warning(f"[积分支付] 卖家入账失败，需后续对账: buyer={user_id} seller={creator_id} price={price} err={e}")
+
+    # 5. 商品销售数 +1（失败不阻断）
+    try:
+        await parse_client.update_object("Product", asset_id, {
+            "sales": parse_client.increment(1)
+        })
+    except Exception as e:
+        logger.warning(f"[积分支付] 更新商品销量失败: {e}")
+
+    # 6. 创建 completed 订单
+    order_no = generate_order_no()
+    try:
+        await parse_client.create_object("Order", {
+            "orderNo": order_no,
+            "userId": user_id,
+            "productId": asset_id,
+            "productName": asset.get("name"),
+            "amount": price,
+            "type": "purchase",
+            "payMethod": "balance",
+            "status": "completed",
+            "completedAt": datetime.now(timezone.utc).isoformat(),
+            "sellerId": creator_id,
+        })
+    except Exception as e:
+        logger.error(f"[积分支付] 创建订单失败: {e}")
+        raise HTTPException(status_code=500, detail="创建订单失败")
+
+    # 7. 同步从购物车移除（失败不阻断）
+    try:
+        import json
+        cart_key = f"cart:{user_id}"
+        cart_data = await redis_client.get(cart_key)
+        if cart_data:
+            items = json.loads(cart_data)
+            new_items = [it for it in items if it.get("asset_id") != asset_id]
+            if new_items:
+                try:
+                    ttl = await redis_client.client.ttl(cart_key)
+                except Exception:
+                    ttl = 0
+                ttl = ttl if (isinstance(ttl, int) and ttl > 0) else CART_TTL
+                await redis_client.set(cart_key, json.dumps(new_items), ex=ttl)
+            else:
+                await redis_client.delete(cart_key)
+    except Exception as e:
+        logger.warning(f"[积分支付] 同步购物车失败（忽略）: {e}")
+
+    return {
+        "success": True,
+        "order_no": order_no,
+        "amount": price,
+        "message": "购买成功",
+    }
+
+
 @router.get("/cart")
 async def get_cart(user_id: str = Depends(get_current_user_id)):
     """获取购物车"""
     cart_key = f"cart:{user_id}"
-    cart_data = await parse_client.redis.get(cart_key)
+    cart_data = await redis_client.get(cart_key)
     if not cart_data:
         return {"data": [], "total": 0}
     
@@ -390,7 +515,7 @@ async def add_to_cart(
         raise HTTPException(status_code=400, detail="不能购买自己发布的资产")
     
     cart_key = f"cart:{user_id}"
-    cart_data = await parse_client.redis.get(cart_key)
+    cart_data = await redis_client.get(cart_key)
     
     import json
     cart_items = json.loads(cart_data) if cart_data else []
@@ -404,7 +529,7 @@ async def add_to_cart(
         "addedAt": datetime.now(timezone.utc).isoformat()
     })
     
-    await parse_client.redis.setex(cart_key, CART_TTL, json.dumps(cart_items))
+    await redis_client.set(cart_key, json.dumps(cart_items), ex=CART_TTL)
     
     return {"success": True, "message": "已添加到购物车", "count": len(cart_items)}
 
@@ -413,7 +538,7 @@ async def add_to_cart(
 async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_user_id)):
     """从购物车移除"""
     cart_key = f"cart:{user_id}"
-    cart_data = await parse_client.redis.get(cart_key)
+    cart_data = await redis_client.get(cart_key)
     if not cart_data:
         raise HTTPException(status_code=400, detail="购物车为空")
     
@@ -421,16 +546,210 @@ async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_use
     cart_items = json.loads(cart_data)
     cart_items = [item for item in cart_items if item["asset_id"] != asset_id]
     
-    await parse_client.redis.setex(cart_key, CART_TTL, json.dumps(cart_items))
+    await redis_client.set(cart_key, json.dumps(cart_items), ex=CART_TTL)
     
     return {"success": True, "message": "已从购物车移除", "count": len(cart_items)}
+
+
+# ============ 管理/运营端接口 ============
+
+class AdminAssetReviewRequest(BaseModel):
+    asset_id: str
+    status: str  # approved / rejected
+    review_note: Optional[str] = None
+
+
+@router.get("/admin/list")
+async def admin_list_assets(
+    page: int = 1,
+    limit: int = 20,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    keyword: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    operator_id: str = Depends(get_operator_user_id),
+):
+    """
+    管理/运营端：获取 AI 资产列表
+    - status: draft / pending / approved / rejected / all
+    - category: image / audio / video / model 等
+    - keyword: 按名称模糊搜索
+    - owner_id: 按所有者 userId 精确过滤
+    """
+    where: dict = {}
+    if status and status != "all":
+        where["status"] = status
+    if category and category != "all":
+        where["category"] = category
+    if keyword:
+        where["name"] = {"$regex": keyword, "$options": "i"}
+    if owner_id:
+        # 支持按 userId 精确 或 用户名 模糊搜索
+        user_kw = owner_id.strip()
+        candidate_ids = {user_kw}
+        try:
+            u_res = await parse_client.query_users(
+                where={"username": {"$regex": user_kw, "$options": "i"}}, limit=50
+            )
+            for u in u_res.get("results", []):
+                if u.get("objectId"):
+                    candidate_ids.add(u["objectId"])
+        except Exception:
+            pass
+        where["ownerId"] = {"$in": list(candidate_ids)} if len(candidate_ids) > 1 else user_kw
+
+    skip = (page - 1) * limit
+    order = "createdAt" if where.get("status") == "pending" else "-createdAt"
+    try:
+        result = await parse_client.query_objects(
+            "AIIPAsset",
+            where=where if where else None,
+            order=order,
+            limit=limit,
+            skip=skip,
+        )
+        total = await parse_client.count_objects("AIIPAsset", where if where else None)
+    except Exception as e:
+        logger.error(f"[Admin][AI资产列表] 查询失败: {e}")
+        raise HTTPException(status_code=500, detail="查询失败")
+
+    # 补充所有者信息
+    items = []
+    owner_cache: dict = {}
+    for a in result.get("results", []):
+        owner_id = a.get("ownerId") or ""
+        owner_name = a.get("ownerName") or ""
+        if not owner_name and owner_id:
+            if owner_id in owner_cache:
+                owner_name = owner_cache[owner_id]
+            else:
+                try:
+                    u = await parse_client.get_user(owner_id)
+                    owner_name = u.get("username") or ""
+                    owner_cache[owner_id] = owner_name
+                except Exception:
+                    owner_cache[owner_id] = ""
+        items.append({
+            "id": a.get("objectId"),
+            "objectId": a.get("objectId"),
+            "name": a.get("name") or "",
+            "description": a.get("description") or "",
+            "category": a.get("category") or "",
+            "price": a.get("price", 0),
+            "status": a.get("status") or "draft",
+            "cover": a.get("cover") or "",
+            "assetUrl": a.get("assetUrl") or "",
+            "ownerId": owner_id,
+            "ownerName": owner_name,
+            "isListed": bool(a.get("isListed")),
+            "listedProductId": a.get("listedProductId") or "",
+            "views": a.get("views", 0),
+            "createdAt": a.get("createdAt"),
+            "updatedAt": a.get("updatedAt"),
+            # 审核相关字段：用于展示驳回/下架原因
+            "reviewNote": a.get("reviewNote") or "",
+            "offlineReason": a.get("offlineReason") or "",
+            "reviewedAt": a.get("reviewedAt") or "",
+            "reviewedBy": a.get("reviewedBy") or "",
+        })
+
+    return {
+        "data": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
+@router.post("/admin/review")
+async def admin_review_asset(
+    request: AdminAssetReviewRequest,
+    http_request: Request,
+    operator_id: str = Depends(get_operator_user_id),
+):
+    """
+    管理/运营端：审核 AI 资产（approved / rejected）
+    """
+    if request.status not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="status 只能为 approved 或 rejected")
+
+    try:
+        asset = await parse_client.get_object("AIIPAsset", request.asset_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="资产不存在")
+
+    previous_status = asset.get("status")
+    update_data: dict = {
+        "status": request.status,
+        "reviewedAt": datetime.now(timezone.utc).isoformat(),
+        "reviewedBy": operator_id,
+    }
+    if request.review_note:
+        update_data["reviewNote"] = request.review_note
+    # 驳回时，同步写入 offlineReason，便于用户端展示具体原因
+    if request.status == "rejected":
+        update_data["offlineReason"] = request.review_note or (
+            "已审核商品被驳回下架" if previous_status == "approved" else "审核驳回"
+        )
+
+    try:
+        await parse_client.update_object("AIIPAsset", request.asset_id, update_data)
+    except Exception as e:
+        logger.error(f"[Admin][AI资产审核] 更新失败: {e}")
+        raise HTTPException(status_code=500, detail="审核失败")
+
+    # 如果资产已关联 Product（提交审核时创建），同步更新 Product 状态
+    listed_product_id = asset.get("listedProductId")
+    if listed_product_id:
+        try:
+            product_update: dict = {
+                "status": request.status,
+                "reviewedAt": update_data["reviewedAt"],
+                "reviewedBy": operator_id,
+                "reviewNote": request.review_note or "",
+            }
+            if request.status == "rejected":
+                product_update["offlineReason"] = update_data.get("offlineReason", "审核驳回")
+            await parse_client.update_object("Product", listed_product_id, product_update)
+        except Exception as e:
+            logger.warning(f"[Admin][AI资产审核] 同步 Product 状态失败: {e}")
+
+    await log_operation(
+        operator_id=operator_id,
+        action="review",
+        module="assets",
+        target_class="AIIPAsset",
+        target_id=request.asset_id,
+        target_name=asset.get("name") or "",
+        description=f"AI资产审核: {request.status}",
+        detail={"note": request.review_note or ""},
+        request=http_request,
+    )
+
+    return {"success": True, "asset_id": request.asset_id, "status": request.status}
+
+
+@router.get("/admin/stats")
+async def admin_asset_stats(operator_id: str = Depends(get_operator_user_id)):
+    """管理/运营端：AI 资产统计"""
+    stats: dict = {}
+    for st in ("draft", "pending", "approved", "rejected"):
+        try:
+            stats[st] = await parse_client.count_objects("AIIPAsset", {"status": st})
+        except Exception:
+            stats[st] = 0
+    try:
+        stats["total"] = await parse_client.count_objects("AIIPAsset")
+    except Exception:
+        stats["total"] = 0
+    return stats
 
 
 @router.post("/cart/checkout")
 async def checkout_cart(user_id: str = Depends(get_current_user_id)):
     """购物车结算"""
     cart_key = f"cart:{user_id}"
-    cart_data = await parse_client.redis.get(cart_key)
+    cart_data = await redis_client.get(cart_key)
     if not cart_data:
         raise HTTPException(status_code=400, detail="购物车为空")
     
@@ -463,7 +782,7 @@ async def checkout_cart(user_id: str = Depends(get_current_user_id)):
         except:
             pass
     
-    await parse_client.redis.delete(cart_key)
+    await redis_client.delete(cart_key)
     
     return {
         "success": True,

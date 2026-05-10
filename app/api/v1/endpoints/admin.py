@@ -254,14 +254,29 @@ async def admin_list_orders(
     limit: int = 20,
     status: Optional[str] = None,
     search: Optional[str] = None,
+    buyer_user_id: Optional[str] = None,
     user_id: str = Depends(get_operator_user_id),
 ):
-    """管理员查看全部订单（支持状态筛选和订单号搜索）"""
+    """管理员查看全部订单（支持状态筛选、订单号搜索、按购买者 userId 过滤）"""
     where: dict = {}
     if status:
         where["status"] = status
     if search:
         where["orderNo"] = {"$regex": search, "$options": "i"}
+    if buyer_user_id:
+        # 支持按 userId 精确 或 用户名 模糊搜索
+        user_kw = buyer_user_id.strip()
+        candidate_ids = {user_kw}
+        try:
+            u_res = await parse_client.query_users(
+                where={"username": {"$regex": user_kw, "$options": "i"}}, limit=50
+            )
+            for u in u_res.get("results", []):
+                if u.get("objectId"):
+                    candidate_ids.add(u["objectId"])
+        except Exception:
+            pass
+        where["userId"] = {"$in": list(candidate_ids)} if len(candidate_ids) > 1 else user_kw
 
     skip = (page - 1) * limit
     result = await parse_client.query_objects(
@@ -757,27 +772,136 @@ async def update_recharge_plan(
 async def list_account_records(
     page: int = 1,
     limit: int = 50,
+    user_kw: Optional[str] = None,
     user_id: str = Depends(get_operator_user_id),
 ):
-    """获取平台账户资金明细"""
+    """获取平台账户资金明细（支持按目标用户 userId/用户名 搜索）"""
+    where: dict = {}
+    if user_kw and user_kw.strip():
+        kw = user_kw.strip()
+        candidate_ids = {kw}
+        try:
+            u_res = await parse_client.query_users(
+                where={"username": {"$regex": kw, "$options": "i"}}, limit=50
+            )
+            for u in u_res.get("results", []):
+                if u.get("objectId"):
+                    candidate_ids.add(u["objectId"])
+        except Exception:
+            pass
+        where["userId"] = {"$in": list(candidate_ids)} if len(candidate_ids) > 1 else kw
+
     skip = (page - 1) * limit
     result = await parse_client.query_objects(
-        "AccountRecord", order="-createdAt", limit=limit, skip=skip
+        "AccountRecord",
+        where=where if where else None,
+        order="-createdAt",
+        limit=limit,
+        skip=skip,
     )
-    total = await parse_client.count_objects("AccountRecord")
+    total = await parse_client.count_objects("AccountRecord", where if where else None)
+
+    # 补充目标用户名（带缓存）
+    user_cache: dict = {}
     records = []
     for item in result.get("results", []):
+        target_uid = item.get("userId") or ""
+        target_username = item.get("username") or ""
+        if target_uid and not target_username:
+            if target_uid in user_cache:
+                target_username = user_cache[target_uid]
+            else:
+                try:
+                    u = await parse_client.get_user(target_uid)
+                    target_username = u.get("username", "") if u else ""
+                except Exception:
+                    target_username = ""
+                user_cache[target_uid] = target_username
         records.append({
             "id": item["objectId"],
+            "userId": target_uid,
+            "username": target_username,
             "type": item.get("type", ""),
             "category": item.get("category", ""),
             "amount": item.get("amount", 0),
             "balance": item.get("balance", 0),
+            "balance_before": item.get("balance_before", 0),
+            "balance_after": item.get("balance_after", 0),
             "description": item.get("description", ""),
             "relatedOrderNo": item.get("relatedOrderNo"),
+            "operatorId": item.get("operator_id", ""),
+            "operatorName": item.get("operator_name", ""),
             "createdAt": item.get("createdAt", ""),
         })
-    return {"records": records, "total": total}
+    return {"records": records, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/accounts/user-balances")
+async def list_user_balances(
+    page: int = 1,
+    limit: int = 20,
+    keyword: Optional[str] = None,
+    role: Optional[str] = None,
+    user_id: str = Depends(get_operator_user_id),
+):
+    """
+    返回所有用户的余额列表（运营平台「账户明细」的用户余额视图）
+    - keyword：按 userId 精确 或 用户名/邮箱 模糊搜索
+    - role：过滤角色（默认 user）
+    """
+    where: dict = {}
+    # 默认只看普通用户，避免展示 admin/operator
+    where["role"] = role if role else "user"
+    if keyword and keyword.strip():
+        kw = keyword.strip()
+        where["$or"] = [
+            {"objectId": kw},
+            {"username": {"$regex": kw, "$options": "i"}},
+            {"email": {"$regex": kw, "$options": "i"}},
+        ]
+
+    skip = (page - 1) * limit
+    try:
+        result = await parse_client.query_users(
+            where=where if where else None,
+            order="-createdAt",
+            limit=limit,
+            skip=skip,
+        )
+    except Exception as e:
+        logger.error(f"[Admin][用户余额] 查询失败: {e}")
+        raise HTTPException(status_code=500, detail="查询用户余额列表失败")
+
+    items = []
+    total_coins = 0.0
+    for u in result.get("results", []):
+        coins = float(u.get("coins", 0) or 0)
+        total_coins += coins
+        items.append({
+            "userId": u.get("objectId"),
+            "username": u.get("username", ""),
+            "email": u.get("email", ""),
+            "role": u.get("role", "user"),
+            "level": u.get("level", 1),
+            "memberLevel": u.get("memberLevel", "none"),
+            "coins": coins,
+            "status": u.get("status", "active"),
+            "createdAt": u.get("createdAt", ""),
+        })
+
+    # 查询满足条件的总记录数，用于分页（_User 必须 Master Key）
+    try:
+        total_count = await parse_client.count_users(where if where else None)
+    except Exception:
+        total_count = len(items)
+
+    return {
+        "data": items,
+        "total": total_count,
+        "page": page,
+        "limit": limit,
+        "pageCoinsTotal": round(total_coins, 2),
+    }
 
 
 @router.get("/accounts/summary")
