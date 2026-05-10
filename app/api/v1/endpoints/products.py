@@ -309,23 +309,32 @@ async def get_pending_products(
 
     total = await parse_client.count_objects("Product", where if where else None)
 
-    # 附带创建者用户名（带缓存）
+    # 附带创建者用户名 + 审核人用户名（共用缓存）
     products_list = result.get("results", [])
-    creator_cache: dict = {}
+    user_cache: dict = {}
+
+    async def _resolve_name(uid: str) -> str:
+        if not uid:
+            return ""
+        if uid in user_cache:
+            return user_cache[uid]
+        try:
+            u = await parse_client.get_user(uid)
+            name = (u.get("username", "") if u else "") or ""
+        except Exception:
+            name = ""
+        user_cache[uid] = name
+        return name
+
     for p in products_list:
         cid = p.get("creatorId") or ""
         if cid and not p.get("creatorName"):
-            if cid in creator_cache:
-                p["creatorName"] = creator_cache[cid]
-            else:
-                try:
-                    u = await parse_client.get_user(cid)
-                    name = u.get("username", "") if u else ""
-                    creator_cache[cid] = name
-                    p["creatorName"] = name
-                except Exception:
-                    creator_cache[cid] = ""
-                    p["creatorName"] = ""
+            p["creatorName"] = await _resolve_name(cid)
+        rid = p.get("reviewedBy") or ""
+        if rid:
+            p["reviewerName"] = await _resolve_name(rid)
+        else:
+            p["reviewerName"] = ""
 
     return {
         "data": products_list,

@@ -499,30 +499,61 @@ async def purchase_asset_with_balance(
 
 @router.get("/cart")
 async def get_cart(user_id: str = Depends(get_current_user_id)):
-    """获取购物车"""
+    """获取购物车（容错：清理已删/下架的无效项）"""
     cart_key = f"cart:{user_id}"
     cart_data = await redis_client.get(cart_key)
     if not cart_data:
         return {"data": [], "total": 0}
-    
+
     import json
-    cart_items = json.loads(cart_data)
-    
+    try:
+        cart_items = json.loads(cart_data)
+    except Exception:
+        cart_items = []
+
     result = []
+    valid_raw_items = []  # 保留有效购物车原始项（用于回写 Redis）
+    has_invalid = False
     for item in cart_items:
+        asset_id = item.get("asset_id") if isinstance(item, dict) else None
+        if not asset_id:
+            has_invalid = True
+            continue
         try:
-            product = await parse_client.get_object("Product", item["asset_id"])
-            if product and product.get("status") == "approved":
-                result.append({
-                    "asset_id": item["asset_id"],
-                    "name": product.get("name"),
-                    "price": product.get("price", 0),
-                    "coverKey": product.get("coverKey"),
-                    "addedAt": item.get("addedAt"),
-                })
-        except:
-            pass
-    
+            product = await parse_client.get_object("Product", asset_id)
+        except Exception as e:
+            # Product 已删除或查询失败 → 跳过，标记需清理
+            logger.warning(f"[Cart] 购物车项失效 asset_id={asset_id}: {e}")
+            has_invalid = True
+            continue
+        if not product or product.get("status") != "approved":
+            # 下架/未审核 → 清理
+            has_invalid = True
+            continue
+        result.append({
+            "asset_id": asset_id,
+            "name": product.get("name"),
+            "price": product.get("price", 0),
+            "coverKey": product.get("coverKey"),
+            "addedAt": item.get("addedAt"),
+        })
+        valid_raw_items.append(item)
+
+    # 有无效项 → 回写 Redis，避免下次反复报错
+    if has_invalid:
+        try:
+            if valid_raw_items:
+                try:
+                    ttl = await redis_client.client.ttl(cart_key)
+                except Exception:
+                    ttl = 0
+                ttl = ttl if (isinstance(ttl, int) and ttl > 0) else CART_TTL
+                await redis_client.set(cart_key, json.dumps(valid_raw_items), ex=ttl)
+            else:
+                await redis_client.delete(cart_key)
+        except Exception as e:
+            logger.warning(f"[Cart] 清理无效项回写 Redis 失败: {e}")
+
     total = sum(item["price"] for item in result)
     return {"data": result, "total": total}
 
@@ -568,18 +599,24 @@ async def add_to_cart(
 
 @router.delete("/cart/{asset_id}")
 async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_user_id)):
-    """从购物车移除"""
+    """从购物车移除（幂等：购物车为空或项不存在也返回成功）"""
     cart_key = f"cart:{user_id}"
     cart_data = await redis_client.get(cart_key)
     if not cart_data:
-        raise HTTPException(status_code=400, detail="购物车为空")
-    
+        return {"success": True, "message": "购物车为空", "count": 0}
+
     import json
-    cart_items = json.loads(cart_data)
-    cart_items = [item for item in cart_items if item["asset_id"] != asset_id]
-    
-    await redis_client.set(cart_key, json.dumps(cart_items), ex=CART_TTL)
-    
+    try:
+        cart_items = json.loads(cart_data)
+    except Exception:
+        cart_items = []
+    cart_items = [item for item in cart_items if isinstance(item, dict) and item.get("asset_id") != asset_id]
+
+    if cart_items:
+        await redis_client.set(cart_key, json.dumps(cart_items), ex=CART_TTL)
+    else:
+        await redis_client.delete(cart_key)
+
     return {"success": True, "message": "已从购物车移除", "count": len(cart_items)}
 
 
@@ -645,22 +682,30 @@ async def admin_list_assets(
         logger.error(f"[Admin][AI资产列表] 查询失败: {e}")
         raise HTTPException(status_code=500, detail="查询失败")
 
-    # 补充所有者信息
+    # 补充所有者信息 + 审核人用户名（共用缓存）
     items = []
-    owner_cache: dict = {}
+    user_cache: dict = {}
+
+    async def _resolve_name(uid: str) -> str:
+        if not uid:
+            return ""
+        if uid in user_cache:
+            return user_cache[uid]
+        try:
+            u = await parse_client.get_user(uid)
+            name = (u.get("username") or "") if u else ""
+        except Exception:
+            name = ""
+        user_cache[uid] = name
+        return name
+
     for a in result.get("results", []):
         owner_id = a.get("ownerId") or ""
         owner_name = a.get("ownerName") or ""
         if not owner_name and owner_id:
-            if owner_id in owner_cache:
-                owner_name = owner_cache[owner_id]
-            else:
-                try:
-                    u = await parse_client.get_user(owner_id)
-                    owner_name = u.get("username") or ""
-                    owner_cache[owner_id] = owner_name
-                except Exception:
-                    owner_cache[owner_id] = ""
+            owner_name = await _resolve_name(owner_id)
+        reviewer_id = a.get("reviewedBy") or ""
+        reviewer_name = await _resolve_name(reviewer_id) if reviewer_id else ""
         items.append({
             "id": a.get("objectId"),
             "objectId": a.get("objectId"),
@@ -682,7 +727,8 @@ async def admin_list_assets(
             "reviewNote": a.get("reviewNote") or "",
             "offlineReason": a.get("offlineReason") or "",
             "reviewedAt": a.get("reviewedAt") or "",
-            "reviewedBy": a.get("reviewedBy") or "",
+            "reviewedBy": reviewer_id,
+            "reviewerName": reviewer_name,
         })
 
     return {
@@ -821,4 +867,205 @@ async def checkout_cart(user_id: str = Depends(get_current_user_id)):
         "orders": orders,
         "total": total_amount,
         "message": f"已创建 {len(orders)} 个订单"
+    }
+
+
+@router.post("/cart/checkout-with-balance")
+async def checkout_cart_with_balance(user_id: str = Depends(get_current_user_id)):
+    """
+    使用账户积分余额结算购物车（批量支付）。
+    步骤：
+    1. 读取购物车，过滤已删/未上架/自有/已购买的商品
+    2. 汇总有效商品总价，预校验用户余额充足，不足直接报错
+    3. 循环逐件执行：扣买家 → 加卖家 → Product.sales+1 → 创建 completed 订单
+    4. 成功项从购物车移除；全部处理完成后返回总结
+    """
+    import json
+    cart_key = f"cart:{user_id}"
+    cart_data = await redis_client.get(cart_key)
+    if not cart_data:
+        raise HTTPException(status_code=400, detail="购物车为空")
+    try:
+        cart_items = json.loads(cart_data)
+    except Exception:
+        cart_items = []
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="购物车为空")
+
+    # 1. 逐项校验，收集有效商品
+    valid_list = []  # [(asset_id, product, price)]
+    skipped = []     # [{asset_id, reason}]
+    for item in cart_items:
+        aid = item.get("asset_id") if isinstance(item, dict) else None
+        if not aid:
+            continue
+        try:
+            product = await parse_client.get_object("Product", aid)
+        except Exception as e:
+            logger.warning(f"[购物车结算] 商品查询失败 {aid}: {e}")
+            skipped.append({"asset_id": aid, "reason": "商品不存在"})
+            continue
+        if not product or product.get("status") != "approved":
+            skipped.append({"asset_id": aid, "reason": "商品已下架"})
+            continue
+        if product.get("creatorId") == user_id:
+            skipped.append({"asset_id": aid, "reason": "不能购买自己的商品"})
+            continue
+        # 重复购买校验
+        try:
+            existing = await parse_client.query_objects(
+                "Order",
+                where={"userId": user_id, "productId": aid, "status": "completed"}
+            )
+            if existing.get("results"):
+                skipped.append({"asset_id": aid, "reason": "已购买过"})
+                continue
+        except Exception:
+            pass
+        price = float(product.get("price", 0) or 0)
+        valid_list.append((aid, product, price))
+
+    if not valid_list:
+        raise HTTPException(status_code=400, detail="购物车中无可购买的商品")
+
+    # 2. 余额预校验
+    total_amount = sum(p for (_, _, p) in valid_list)
+    try:
+        buyer = await parse_client.get_user(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    balance = incentive_service._read_balance(buyer)
+    if total_amount > 0 and balance < total_amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"积分余额不足，需要 {total_amount:g} 积分，当前 {balance:g}"
+        )
+
+    # 3. 逐项执行交易
+    completed_orders = []
+    completed_asset_ids = set()
+    for (aid, product, price) in valid_list:
+        creator_id = product.get("creatorId")
+        order_no = generate_order_no()
+
+        # 扣买家
+        if price > 0:
+            br = await incentive_service.adjust_user_balance(
+                user_id=user_id,
+                delta=-float(price),
+                type_="purchase",
+                category="product_purchase",
+                description=f"购买商品: {product.get('name', '')}",
+                related_id=f"purchase_{order_no}",
+                related_order_no=order_no,
+            )
+            if not br.get("success"):
+                logger.error(f"[购物车结算] 扣买家失败 order_no={order_no} err={br.get('error')}")
+                # 后续商品不再执行，直接跳出（实际用户余额足够时几乎不应发生）
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"支付失败（部分订单已完成）: {br.get('error', '')}"
+                )
+
+            # 加卖家；失败则回滚买家
+            if creator_id:
+                sr = await incentive_service.adjust_user_balance(
+                    user_id=creator_id,
+                    delta=float(price),
+                    type_="reward",
+                    category="product_income",
+                    description=f"商品售卖收入: {product.get('name', '')}",
+                    related_id=f"income_{order_no}",
+                    related_order_no=order_no,
+                )
+                if not sr.get("success"):
+                    logger.error(
+                        f"[购物车结算] 卖家入账失败，回滚买家 order_no={order_no} err={sr.get('error')}"
+                    )
+                    try:
+                        await incentive_service.adjust_user_balance(
+                            user_id=user_id,
+                            delta=float(price),
+                            type_="refund",
+                            category="purchase_rollback",
+                            description=f"商品购买回滚（卖家入账失败）: {product.get('name', '')}",
+                            related_id=f"purchase_rollback_{order_no}",
+                            related_order_no=order_no,
+                            check_idempotent=False,
+                        )
+                    except Exception as _re:
+                        logger.error(f"[购物车结算] 买家回滚异常: {_re}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"卖家入账失败，已回滚该笔交易（前面订单已完成）: {sr.get('error', '')}"
+                    )
+
+        # 商品销售数+1（失败不阻断）
+        try:
+            await parse_client.update_object("Product", aid, {
+                "sales": parse_client.increment(1)
+            })
+        except Exception as e:
+            logger.warning(f"[购物车结算] 更新商品销量失败 {aid}: {e}")
+
+        # 创建 completed 订单
+        try:
+            await parse_client.create_object("Order", {
+                "orderNo": order_no,
+                "userId": user_id,
+                "productId": aid,
+                "productName": product.get("name"),
+                "amount": price,
+                "type": "purchase",
+                "payMethod": "balance",
+                "status": "completed",
+                "completedAt": datetime.now(timezone.utc).isoformat(),
+                "sellerId": creator_id,
+            })
+        except Exception as e:
+            logger.error(f"[购物车结算] 创建订单失败 {aid}: {e}")
+
+        completed_orders.append({
+            "order_no": order_no,
+            "asset_id": aid,
+            "name": product.get("name"),
+            "amount": price,
+        })
+        completed_asset_ids.add(aid)
+
+    # 4. 清理购物车：仅移除已完成/已跳过的商品
+    try:
+        skipped_ids = {s["asset_id"] for s in skipped}
+        remaining = [
+            it for it in cart_items
+            if isinstance(it, dict)
+            and it.get("asset_id")
+            and it["asset_id"] not in completed_asset_ids
+            and it["asset_id"] not in skipped_ids
+        ]
+        if remaining:
+            try:
+                ttl = await redis_client.client.ttl(cart_key)
+            except Exception:
+                ttl = 0
+            ttl = ttl if (isinstance(ttl, int) and ttl > 0) else CART_TTL
+            await redis_client.set(cart_key, json.dumps(remaining), ex=ttl)
+        else:
+            await redis_client.delete(cart_key)
+    except Exception as e:
+        logger.warning(f"[购物车结算] 清理购物车失败（忽略）: {e}")
+
+    # 5. 返回最新余额
+    try:
+        buyer_after = await parse_client.get_user(user_id)
+        balance_after = incentive_service._read_balance(buyer_after)
+    except Exception:
+        balance_after = max(balance - total_amount, 0)
+
+    return {
+        "success": True,
+        "orders": completed_orders,
+        "total_amount": total_amount,
+        "balance_after": balance_after,
+        "message": f"支付成功，共 {len(completed_orders)} 件商品",
     }
