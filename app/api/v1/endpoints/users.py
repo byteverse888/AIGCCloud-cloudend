@@ -23,7 +23,7 @@ from app.core.security import (
     checksum_address,
     decode_access_token,
 )
-from app.core.deps import get_current_user_id, get_admin_user_id
+from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_user_id
 from app.core.config import settings
 from app.core.logger import logger
 
@@ -190,7 +190,7 @@ async def register_phone(request: PhoneRegisterRequest):
     # 处理邀请码
     if request.invite_code:
         inviter = await parse_client.query_users(
-            where={"objectId": {"$regex": f"^{request.invite_code}"}}
+            where={"objectId": request.invite_code}
         )
         if inviter.get("results"):
             inviter_user = inviter["results"][0]
@@ -267,7 +267,7 @@ async def activate_user(token: str):
     if user_data.get("invite_code"):
         # 查找邀请人
         inviter = await parse_client.query_users(
-            where={"objectId": {"$regex": f"^{user_data['invite_code']}"}}
+            where={"objectId": user_data['invite_code']}
         )
         if inviter.get("results"):
             inviter_user = inviter["results"][0]
@@ -601,6 +601,228 @@ async def check_membership(user_id: str):
         raise HTTPException(status_code=404, detail="User not found")
 
 
+import secrets
+import string
+
+
+class ResetUserPasswordRequest(BaseModel):
+    user_id: str
+    new_password: Optional[str] = None
+
+
+class RechargeUserAccountRequest(BaseModel):
+    user_id: str
+    amount: float
+
+
+@router.post("/admin/reset-password")
+async def reset_user_password(
+    request: ResetUserPasswordRequest,
+    operator_id: str = Depends(get_operator_user_id)
+):
+    """
+    重置用户密码（Operator/Admin权限）
+    生成随机8位密码或使用指定的密码
+    """
+    logger.info(f"[User] Operator {operator_id} 正在重置用户 {request.user_id} 的密码")
+    
+    # 检查目标用户是否存在
+    try:
+        target_user = await parse_client.get_user(request.user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    # 生成随机密码
+    if request.new_password:
+        new_password = request.new_password
+    else:
+        characters = string.ascii_letters + string.digits
+        new_password = ''.join(secrets.choice(characters) for _ in range(8))
+    
+    # 使用 Master Key 更新密码
+    await parse_client.update_user_with_master_key(request.user_id, {"password": new_password})
+    
+    logger.info(f"[User] 用户 {request.user_id} 密码已重置")
+    
+    return {
+        "success": True,
+        "message": "密码重置成功",
+        "new_password": new_password
+    }
+
+
+@router.post("/admin/recharge")
+async def recharge_user_account(
+    request: RechargeUserAccountRequest,
+    operator_id: str = Depends(get_operator_user_id)
+):
+    """
+    为用户充值（Operator/Admin权限）
+    在 AccountRecord 中添加充值记录
+    """
+    logger.info(f"[User] Operator {operator_id} 正在为用户 {request.user_id} 充值 {request.amount}")
+    
+    # 验证充值金额
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="充值金额必须大于0")
+    
+    if request.amount > 100000:
+        raise HTTPException(status_code=400, detail="单次充值金额不能超过100000")
+    
+    # 检查目标用户是否存在
+    try:
+        target_user = await parse_client.get_user(request.user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    # 获取操作者信息
+    operator_user = await parse_client.get_user(operator_id)
+    operator_name = operator_user.get("username", "unknown")
+    
+    # 获取用户当前余额
+    web3_address = target_user.get("web3Address")
+    current_balance = 0
+    if web3_address:
+        try:
+            current_balance = await web3_client.get_balance(web3_address)
+        except Exception:
+            pass
+    
+    # 创建账户充值记录
+    record_data = {
+        "userId": request.user_id,
+        "amount": request.amount,
+        "type": "recharge",
+        "balance_before": current_balance,
+        "balance_after": current_balance + request.amount,
+        "operator_id": operator_id,
+        "operator_name": operator_name,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    result = await parse_client.create_object("AccountRecord", record_data)
+    
+    logger.info(f"[User] 用户 {request.user_id} 充值成功: +{request.amount}, 操作者: {operator_name}")
+    
+    return {
+        "success": True,
+        "message": "充值成功",
+        "amount": request.amount,
+        "new_balance": current_balance + request.amount,
+        "record_id": result.get("objectId")
+    }
+
+
+class UpdateUserRequest(BaseModel):
+    user_id: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    level: Optional[int] = None
+
+
+@router.put("/admin/update")
+async def update_user(
+    request: UpdateUserRequest,
+    admin_id: str = Depends(get_admin_user_id)
+):
+    """
+    更新用户信息（Admin权限）
+    """
+    logger.info(f"[User] Admin {admin_id} 正在更新用户 {request.user_id} 的信息")
+    
+    # 构建更新数据
+    update_data = {}
+    if request.email is not None:
+        update_data["email"] = request.email
+    if request.phone is not None:
+        update_data["phone"] = request.phone
+    if request.level is not None:
+        update_data["level"] = request.level
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="没有需要更新的字段")
+    
+    # 使用 Master Key 更新用户
+    try:
+        await parse_client.update_user_with_master_key(request.user_id, update_data)
+    except Exception as e:
+        logger.error(f"[User] 更新用户失败: {str(e)}")
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    logger.info(f"[User] 用户 {request.user_id} 信息已更新")
+    
+    return {
+        "success": True,
+        "message": "用户信息更新成功"
+    }
+
+
+@router.post("/admin/create")
+async def create_user(
+    request: dict,
+    admin_id: str = Depends(get_admin_user_id)
+):
+    """
+    管理员创建新用户
+    - 用户名必填，3-20字符
+    - 密码必填，最少6位
+    - 邮箱选填，格式验证
+    - 手机号选填，格式验证
+    - 角色必填，默认 user，可选 user/operator
+    - 等级默认值1
+    - 创建后 status="inactive"
+    """
+    username = request.get("username", "").strip()
+    password = request.get("password", "").strip()
+    email = request.get("email", "").strip() or None
+    phone = request.get("phone", "").strip() or None
+    role = request.get("role", "user")
+    level = request.get("level", 1)
+
+    # 验证用户名
+    if not username or len(username) < 3 or len(username) > 20:
+        raise HTTPException(status_code=400, detail="用户名必须为3-20个字符")
+
+    # 验证密码
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少6位")
+
+    # 验证角色
+    if role not in ("user", "operator"):
+        raise HTTPException(status_code=400, detail="角色只能是 user 或 operator")
+
+    # 检查用户名是否已存在
+    existing = await parse_client.query_users(where={"username": username})
+    if existing.get("results"):
+        raise HTTPException(status_code=400, detail="用户名已存在")
+
+    # 创建用户
+    try:
+        # 设置默认 status 为 inactive
+        user_data = {
+            "username": username,
+            "password": password,  # Parse 会自动加密
+            "role": role,
+            "level": level,
+            "status": "inactive",  # 需要管理员手动启用
+        }
+        if email:
+            user_data["email"] = email
+        if phone:
+            user_data["phone"] = phone
+
+        result = await parse_client.create_user(user_data)
+
+        return {
+            "success": True,
+            "user_id": result.get("objectId", ""),
+            "objectId": result.get("objectId", "")
+        }
+    except Exception as e:
+        logger.error(f"[Admin] 创建用户失败: {e}")
+        raise HTTPException(status_code=500, detail="创建失败，请重试")
+
+
 @router.get("/admin/list")
 async def list_users(
     page: int = 1,
@@ -862,3 +1084,79 @@ async def unbind_wallet(
     except Exception as e:
         logger.error(f"[Wallet] 解绑失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"解绑失败: {str(e)}")
+
+
+class WithdrawRequestModel(BaseModel):
+    amount: float
+    method: str
+    account: str
+    account_name: str
+    bank_name: Optional[str] = None
+
+
+@router.post("/withdraw")
+async def create_withdraw_request(
+    request: WithdrawRequestModel,
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    创建提现申请
+    """
+    if request.amount < 10:
+        raise HTTPException(status_code=400, detail="最低提现金额为10元")
+    
+    if request.amount > 10000:
+        raise HTTPException(status_code=400, detail="单次最高提现10000元")
+    
+    pending_result = await parse_client.query_objects(
+        "WithdrawRequest",
+        where={
+            "userId": user_id,
+            "status": {"$in": ["pending", "processing"]}
+        },
+        limit=1
+    )
+    if pending_result.get("results"):
+        raise HTTPException(status_code=400, detail="您有一笔提现正在处理中，请等待完成后再申请")
+    
+    earning_result = await parse_client.query_objects(
+        "EarningRecord",
+        where={"userId": user_id, "status": "completed"},
+        limit=1000
+    )
+    records = earning_result.get("results", [])
+    total_earnings = sum(r.get("amount", 0) for r in records if r.get("type") in ("sale", "reward"))
+    withdrawn = sum(abs(r.get("amount", 0)) for r in records if r.get("type") == "withdraw")
+    available = total_earnings - withdrawn
+    
+    if request.amount > available:
+        raise HTTPException(status_code=400, detail="可提现余额不足")
+    
+    withdraw_data = {
+        "userId": user_id,
+        "amount": request.amount,
+        "method": request.method,
+        "account": request.account,
+        "accountName": request.account_name,
+        "bankName": request.bank_name or "",
+        "status": "pending",
+    }
+    
+    result = await parse_client.create_object("WithdrawRequest", withdraw_data)
+    withdraw_id = result.get("objectId")
+    
+    await parse_client.create_object("EarningRecord", {
+        "userId": user_id,
+        "type": "withdraw",
+        "amount": -request.amount,
+        "status": "completed",
+        "relatedId": withdraw_id,
+    })
+    
+    logger.info(f"[提现] 申请创建成功: user={user_id}, amount={request.amount}")
+    
+    return {
+        "success": True,
+        "withdraw_id": withdraw_id,
+        "amount": request.amount,
+    }

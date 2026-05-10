@@ -76,6 +76,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"ARQ Worker 启动失败: {e}")
     
+    # 启动后台订单处理器
+    try:
+        from app.api.v1.endpoints.payment import start_background_order_processor
+        await start_background_order_processor()
+    except Exception as e:
+        logger.error(f"后台订单处理器启动失败: {e}")
+    
     yield
     
     # Shutdown

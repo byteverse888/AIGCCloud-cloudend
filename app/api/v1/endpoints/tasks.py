@@ -366,6 +366,75 @@ async def cancel_task(task_id: str, user_id: str = Depends(get_current_user_id))
     }
 
 
+@router.post("/{task_id}/retry")
+async def retry_task(task_id: str, user_id: str = Depends(get_current_user_id)):
+    """
+    重试失败任务
+    - 仅失败状态(3)可重试
+    - 重置状态为待执行(0)
+    - 不退还金币，需重新支付
+    """
+    # 查询任务
+    tasks = await parse_client.query_objects("AITask", where={"taskId": task_id})
+    
+    if not tasks.get("results"):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task = tasks["results"][0]
+    task_object_id = task["objectId"]
+    
+    # 验证任务归属
+    if task.get("designer") != user_id:
+        raise HTTPException(status_code=403, detail="无权操作此任务")
+    
+    # 只有失败状态可以重试
+    if task.get("status") != TaskStatus.FAILED:
+        raise HTTPException(status_code=400, detail="只有失败任务可以重试")
+    
+    # 检查重试次数
+    retry_count = task.get("retryCount", 0)
+    if retry_count >= 3:
+        raise HTTPException(status_code=400, detail="已达最大重试次数(3次)")
+    
+    # 获取原任务成本
+    cost = task.get("cost", 0)
+    if cost > 0:
+        # 扣除金币
+        user = await parse_client.get_user(user_id)
+        balance = user.get("totalIncentive", 0)
+        if balance < cost:
+            raise HTTPException(status_code=400, detail=f"金币不足，需要{cost}金币")
+        
+        await parse_client.update_user(user_id, {
+            "totalIncentive": parse_client.increment(-cost)
+        })
+    
+    # 重置任务状态
+    await parse_client.update_object("AITask", task_object_id, {
+        "status": TaskStatus.PENDING,
+        "retryCount": retry_count + 1,
+        "error": None,
+    })
+    
+    # 重新添加到处理队列
+    background_tasks.add_task(
+        process_ai_task,
+        task_id=task_id,
+        task_type=task.get("type"),
+        model=task.get("model"),
+        data=task.get("data"),
+    )
+    
+    logger.info(f"[任务重试] task_id={task_id}, retry={retry_count + 1}")
+    
+    return {
+        "success": True,
+        "message": f"任务已重试({retry_count + 1}/3)",
+        "task_id": task_id,
+        "cost": cost,
+    }
+
+
 # ============ 任务完成验证与激励发放 ============
 
 class CompleteTaskRequest(BaseModel):
@@ -732,3 +801,60 @@ async def claim_task(task_id: str, executor: str):
             "data": task.get("data")
         }
     }
+
+
+def _map_type_to_category(task_type: str) -> str:
+    mapping = {
+        "txt2img": "image",
+        "txt2music": "music",
+        "txt2video": "video",
+        "txt2speech": "audio",
+        "comfyui": "image",
+    }
+    return mapping.get(task_type, "other")
+
+
+@router.post("/ai-task/{task_id}/convert")
+async def convert_task_to_asset(
+    task_id: str,
+    user_id: str = Depends(get_current_user_id)
+):
+    """将AIGC任务结果转换为AI资产"""
+    tasks = await parse_client.query_objects("AITask", where={"taskId": task_id})
+    if not tasks.get("results"):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task = tasks["results"][0]
+    
+    designer = task.get("designer")
+    if designer != user_id:
+        raise HTTPException(status_code=403, detail="无权操作")
+    
+    if task.get("status") not in [2, 4]:
+        raise HTTPException(status_code=400, detail="任务未完成")
+    
+    results = task.get("results", [])
+    if not results:
+        raise HTTPException(status_code=400, detail="无有效结果")
+    
+    result = results[0]
+    task_type = task.get("type", "")
+    
+    asset_data = {
+        "name": f"{task_type}_{task_id[:8]}",
+        "category": _map_type_to_category(task_type),
+        "cover": result.get("thumbnail") or result.get("url"),
+        "assetUrl": result.get("url"),
+        "fileUrl": result.get("url"),
+        "status": "draft",
+        "ownerId": user_id,
+        "ownerAddress": task.get("ownerAddress", ""),
+        "copyright": task.get("ownerAddress", ""),
+        "license": "CC-BY-NC-ND",
+        "views": 0,
+        "description": task.get("data", {}).get("prompt", ""),
+    }
+    
+    create_result = await parse_client.create_object("AIIPAsset", asset_data)
+    
+    return {"success": True, "asset_id": create_result.get("objectId")}

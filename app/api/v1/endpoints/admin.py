@@ -7,8 +7,9 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from typing import List
 
-from app.core.deps import get_admin_user_id
+from app.core.deps import get_admin_user_id, get_operator_user_id
 from app.core.parse_client import parse_client
 from app.core.logger import logger
 
@@ -48,7 +49,7 @@ def _week_start() -> str:
 # ==================== 用户统计 ====================
 
 @router.get("/stats/users")
-async def stats_users(admin_id: str = Depends(get_admin_user_id)):
+async def stats_users(user_id: str = Depends(get_operator_user_id)):
     """用户统计：今日新增、总数、角色分布"""
     today = _today_start()
 
@@ -74,7 +75,7 @@ async def stats_users(admin_id: str = Depends(get_admin_user_id)):
 # ==================== 订单统计 ====================
 
 @router.get("/stats/orders")
-async def stats_orders(admin_id: str = Depends(get_admin_user_id)):
+async def stats_orders(user_id: str = Depends(get_operator_user_id)):
     """订单统计：今日订单、总数、各状态数、本周趋势、客单价"""
     today = _today_start()
     week_start = _week_start()
@@ -109,7 +110,7 @@ async def stats_orders(admin_id: str = Depends(get_admin_user_id)):
 
     # 客单价（已完成订单平均金额）
     completed_orders = await parse_client.query_objects(
-        "Order", where={"status": "completed"}, limit=1000, keys="amount"
+        "Order", where={"status": "completed"}, limit=1000
     )
     amounts = [o.get("amount", 0) for o in completed_orders.get("results", [])]
     avg_order_value = round(sum(amounts) / len(amounts), 2) if amounts else 0
@@ -126,7 +127,7 @@ async def stats_orders(admin_id: str = Depends(get_admin_user_id)):
 # ==================== 商品统计 ====================
 
 @router.get("/stats/products")
-async def stats_products(admin_id: str = Depends(get_admin_user_id)):
+async def stats_products(user_id: str = Depends(get_operator_user_id)):
     """商品统计：各状态数、分类分布、热销Top5"""
     statuses = ["draft", "pending", "approved", "rejected", "offline"]
     categories = ["image", "audio", "video", "comic", "music", "digital-human", "model", "other"]
@@ -151,8 +152,7 @@ async def stats_products(admin_id: str = Depends(get_admin_user_id)):
         "Product",
         where={"status": "approved"},
         order="-sales",
-        limit=5,
-        keys="name,category,sales,price"
+        limit=5
     )
     top_products = []
     for p in top_result.get("results", []):
@@ -179,7 +179,7 @@ async def stats_products(admin_id: str = Depends(get_admin_user_id)):
 # ==================== 收入统计 ====================
 
 @router.get("/stats/revenue")
-async def stats_revenue(admin_id: str = Depends(get_admin_user_id)):
+async def stats_revenue(user_id: str = Depends(get_operator_user_id)):
     """收入统计：今日/本月/上月收入、总营收、支付方式分布、本周趋势"""
     today = _today_start()
     this_month = _month_start(0)
@@ -187,7 +187,7 @@ async def stats_revenue(admin_id: str = Depends(get_admin_user_id)):
 
     # 查询已完成订单的金额
     async def sum_revenue(where: dict) -> float:
-        result = await parse_client.query_objects("Order", where=where, limit=1000, keys="amount")
+        result = await parse_client.query_objects("Order", where=where, limit=1000)
         return sum(o.get("amount", 0) for o in result.get("results", []))
 
     base_where = {"status": "completed"}
@@ -254,7 +254,7 @@ async def admin_list_orders(
     limit: int = 20,
     status: Optional[str] = None,
     search: Optional[str] = None,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """管理员查看全部订单（支持状态筛选和订单号搜索）"""
     where: dict = {}
@@ -304,6 +304,87 @@ async def admin_list_orders(
         "page": page,
         "limit": limit,
     }
+
+
+@router.get("/orders/{order_id}")
+async def get_order_detail(
+    order_id: str,
+    user_id: str = Depends(get_operator_user_id)
+):
+    """获取订单详情"""
+    try:
+        order = await parse_client.get_object("Order", order_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    
+    user_id = order.get("userId")
+    username = ""
+    if user_id:
+        try:
+            user = await parse_client.get_user(user_id)
+            username = user.get("username", "")
+        except Exception:
+            pass
+    
+    product_name = ""
+    product_id = order.get("productId")
+    if product_id:
+        try:
+            product = await parse_client.get_object("Product", product_id)
+            product_name = product.get("name", "")
+        except Exception:
+            pass
+    
+    return {
+        "id": order["objectId"],
+        "orderNo": order.get("orderNo", ""),
+        "userId": user_id,
+        "username": username,
+        "productId": product_id,
+        "productName": product_name,
+        "amount": order.get("amount", 0),
+        "status": order.get("status", ""),
+        "type": order.get("type", ""),
+        "paymentMethod": order.get("paymentMethod", "-"),
+        "txHash": order.get("txHash", ""),
+        "createdAt": order.get("createdAt", ""),
+        "paidAt": order.get("paidAt"),
+        "completedAt": order.get("completedAt"),
+    }
+
+
+class RefundRequest(BaseModel):
+    reason: str = ""
+
+
+@router.post("/orders/{order_id}/refund")
+async def refund_order(
+    order_id: str,
+    request: RefundRequest,
+    user_id: str = Depends(get_operator_user_id)
+):
+    """退款订单"""
+    try:
+        order = await parse_client.get_object("Order", order_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    
+    if order.get("status") not in ["pending", "paid", "completed"]:
+        raise HTTPException(status_code=400, detail="该订单状态不允许退款")
+    
+    refund_amount = float(order.get("amount", 0))
+    
+    await parse_client.update_object("Order", order_id, {
+        "status": "refunded",
+        "refundAmount": refund_amount,
+        "refundReason": request.reason,
+        "refundBy": user_id,
+        "refundedAt": datetime.now(timezone.utc).isoformat(),
+    })
+    
+    logger.info(f"[订单退款] order_id={order_id}, amount={refund_amount}, operator={user_id}")
+    
+    return {"success": True, "message": "退款成功", "refund_amount": refund_amount}
 
 
 # ==================== 系统设置 ====================
@@ -458,7 +539,7 @@ class CouponCreateRequest(BaseModel):
 
 
 @router.get("/coupons")
-async def list_coupons(admin_id: str = Depends(get_admin_user_id)):
+async def list_coupons(user_id: str = Depends(get_operator_user_id)):
     """获取券码列表"""
     result = await parse_client.query_objects("Coupon", order="-createdAt", limit=100)
     coupons = []
@@ -484,7 +565,7 @@ async def list_coupons(admin_id: str = Depends(get_admin_user_id)):
 @router.post("/coupons")
 async def create_coupon(
     request: CouponCreateRequest,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """创建券码"""
     coupon = await parse_client.create_object("Coupon", {
@@ -499,20 +580,20 @@ async def create_coupon(
         "totalCount": request.total_count,
         "usedCount": 0,
         "status": "active",
-        "createdBy": admin_id,
+        "createdBy": user_id,
     })
     return {"success": True, "id": coupon.get("objectId")}
 
 
 @router.delete("/coupons/{coupon_id}")
-async def delete_coupon(coupon_id: str, admin_id: str = Depends(get_admin_user_id)):
+async def delete_coupon(coupon_id: str, user_id: str = Depends(get_operator_user_id)):
     """删除券码"""
     await parse_client.delete_object("Coupon", coupon_id)
     return {"success": True}
 
 
 @router.put("/coupons/{coupon_id}/status")
-async def update_coupon_status(coupon_id: str, status: str, admin_id: str = Depends(get_admin_user_id)):
+async def update_coupon_status(coupon_id: str, status: str, user_id: str = Depends(get_operator_user_id)):
     """禁用/启用券码"""
     await parse_client.update_object("Coupon", coupon_id, {"status": status})
     return {"success": True}
@@ -531,7 +612,7 @@ class PromotionCreateRequest(BaseModel):
 
 
 @router.get("/promotions")
-async def list_promotions(admin_id: str = Depends(get_admin_user_id)):
+async def list_promotions(user_id: str = Depends(get_operator_user_id)):
     """获取促销活动列表"""
     result = await parse_client.query_objects("Promotion", order="-createdAt", limit=100)
     promotions = []
@@ -557,7 +638,7 @@ async def list_promotions(admin_id: str = Depends(get_admin_user_id)):
 @router.post("/promotions")
 async def create_promotion(
     request: PromotionCreateRequest,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """创建促销活动"""
     promo = await parse_client.create_object("Promotion", {
@@ -572,20 +653,20 @@ async def create_promotion(
         "productCount": 0,
         "orderCount": 0,
         "revenue": 0,
-        "createdBy": admin_id,
+        "createdBy": user_id,
     })
     return {"success": True, "id": promo.get("objectId")}
 
 
 @router.put("/promotions/{promo_id}/status")
-async def update_promotion_status(promo_id: str, status: str, admin_id: str = Depends(get_admin_user_id)):
+async def update_promotion_status(promo_id: str, status: str, user_id: str = Depends(get_operator_user_id)):
     """更新促销状态 (active/paused/ended)"""
     await parse_client.update_object("Promotion", promo_id, {"status": status})
     return {"success": True}
 
 
 @router.delete("/promotions/{promo_id}")
-async def delete_promotion(promo_id: str, admin_id: str = Depends(get_admin_user_id)):
+async def delete_promotion(promo_id: str, user_id: str = Depends(get_operator_user_id)):
     """删除促销活动"""
     await parse_client.delete_object("Promotion", promo_id)
     return {"success": True}
@@ -603,7 +684,7 @@ class RechargePlanRequest(BaseModel):
 async def list_recharge_records(
     page: int = 1,
     limit: int = 20,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """获取充值记录"""
     skip = (page - 1) * limit
@@ -627,7 +708,7 @@ async def list_recharge_records(
 
 
 @router.get("/recharge/plans")
-async def list_recharge_plans(admin_id: str = Depends(get_admin_user_id)):
+async def list_recharge_plans(user_id: str = Depends(get_operator_user_id)):
     """获取充值方案"""
     result = await parse_client.query_objects("RechargePlan", order="amount", limit=20)
     plans = []
@@ -644,7 +725,7 @@ async def list_recharge_plans(admin_id: str = Depends(get_admin_user_id)):
 @router.post("/recharge/plans")
 async def create_recharge_plan(
     request: RechargePlanRequest,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """创建充值方案"""
     plan = await parse_client.create_object("RechargePlan", {
@@ -659,7 +740,7 @@ async def create_recharge_plan(
 async def update_recharge_plan(
     plan_id: str,
     request: RechargePlanRequest,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """更新充值方案"""
     await parse_client.update_object("RechargePlan", plan_id, {
@@ -676,7 +757,7 @@ async def update_recharge_plan(
 async def list_account_records(
     page: int = 1,
     limit: int = 50,
-    admin_id: str = Depends(get_admin_user_id),
+    user_id: str = Depends(get_operator_user_id),
 ):
     """获取平台账户资金明细"""
     skip = (page - 1) * limit
@@ -700,11 +781,11 @@ async def list_account_records(
 
 
 @router.get("/accounts/summary")
-async def account_summary(admin_id: str = Depends(get_admin_user_id)):
+async def account_summary(user_id: str = Depends(get_operator_user_id)):
     """获取平台账户汇总"""
     # 获取最近一条记录的余额
     latest = await parse_client.query_objects(
-        "AccountRecord", order="-createdAt", limit=1, keys="balance"
+        "AccountRecord", order="-createdAt", limit=1
     )
     balance = 0
     if latest.get("results"):
@@ -712,7 +793,7 @@ async def account_summary(admin_id: str = Depends(get_admin_user_id)):
 
     # 收入和支出汇总
     all_records = await parse_client.query_objects(
-        "AccountRecord", limit=1000, keys="type,amount"
+        "AccountRecord", limit=1000
     )
     total_income = 0
     total_expense = 0

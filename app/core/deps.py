@@ -74,6 +74,31 @@ async def get_admin_user_id(
     return user_id
 
 
+async def verify_operator_user(user_id: str) -> bool:
+    """验证是否为运营人员或管理员"""
+    try:
+        user = await parse_client.get_user(user_id)
+        role = user.get("role")
+        return role in ["operator", "admin"]
+    except Exception:
+        return False
+
+
+async def get_operator_user_id(
+    authorization: Optional[str] = Header(None, alias="Authorization")
+) -> str:
+    """获取并验证运营人员用户ID"""
+    user_id = await get_current_user_id(authorization)
+    
+    if not await verify_operator_user(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operator permission required"
+        )
+    
+    return user_id
+
+
 # ============ Parse Session Token 验证 ============
 
 async def get_parse_user(

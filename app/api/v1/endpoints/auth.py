@@ -102,36 +102,14 @@ async def get_captcha():
     
     返回:
         - captcha_id: 验证码ID，用于提交时验证
-        - image: Base64编码的PNG图片
+        - image: data:image/png;base64,... 格式的图片
     """
-    from fastapi.responses import Response
-    import base64
-    
-    captcha_id, image_bytes = await captcha_service.generate()
-    
-    # 返回 JSON 格式，图片使用 base64 编码
-    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    captcha_id, image_data = await captcha_service.generate()
     
     return {
         "captcha_id": captcha_id,
-        "image": f"data:image/png;base64,{image_base64}"
+        "image": image_data
     }
-
-
-@router.get("/captcha/image/{captcha_id}")
-async def get_captcha_image(captcha_id: str):
-    """
-    获取验证码图片（直接返回PNG）
-    """
-    from fastapi.responses import Response
-    
-    _, image_bytes = await captcha_service.generate()
-    
-    return Response(
-        content=image_bytes,
-        media_type="image/png",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
-    )
 
 
 @router.post("/login", response_model=LoginResponse, dependencies=[Depends(login_rate_limit)])

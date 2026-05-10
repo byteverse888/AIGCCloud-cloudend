@@ -12,6 +12,7 @@ from app.core.logger import logger
 from app.core.parse_client import parse_client
 from app.core.wechat_pay import wechat_pay, MEMBER_PLANS
 from app.core.incentive_service import incentive_service
+from app.core.deps import get_current_user_id
 
 router = APIRouter()
 
@@ -23,7 +24,6 @@ class SubscribeRequest(BaseModel):
     user_id: str
     plan_id: str  # 套餐ID: vip_month, vip_year, svip_month 等
     openid: Optional[str] = None  # 微信openid（JSAPI支付需要）
-    session_token: Optional[str] = None  # Parse session token，用于更新用户信息
 
 
 class SubscribeResponse(BaseModel):
@@ -37,7 +37,6 @@ class SubscribeResponse(BaseModel):
 class SimulatePayRequest(BaseModel):
     """模拟支付请求（测试模式）"""
     order_id: str
-    session_token: Optional[str] = None  # 用于更新用户信息
 
 
 class MemberStatusResponse(BaseModel):
@@ -86,30 +85,27 @@ async def subscribe_member(request: SubscribeRequest):
     
     流程:
     1. 验证套餐
-    2. 检查是否允许购买（禁止降级）
-    3. 创建订单记录
-    4. 调用微信支付
-    5. 返回支付参数
+    2. 通过 JWT 认证验证用户
+    3. 检查是否允许购买（禁止降级）
+    4. 创建订单记录
+    5. 调用微信支付
+    6. 返回支付参数
     """
     # 1. 验证套餐
     plan = MEMBER_PLANS.get(request.plan_id)
     if not plan:
         raise HTTPException(status_code=400, detail="无效的套餐ID")
     
-    # 2. 通过 session token 验证用户
-    logger.info(f"[会员订阅] user_id={request.user_id}, session_token={request.session_token[:20] if request.session_token else 'None'}...")
-    
-    if not request.session_token:
-        raise HTTPException(status_code=401, detail="未提供会话令牌")
+    # 2. 通过 JWT 认证获取用户
+    user_id = get_current_user_id()
+    logger.info(f"[会员订阅] user_id={request.user_id}")
     
     try:
-        user = await parse_client.get_current_user(request.session_token)
+        user = await parse_client.get_user(user_id)
         logger.info(f"[会员订阅] 获取用户成功: {user.get('objectId')}")
-        if user.get("objectId") != request.user_id:
-            raise HTTPException(status_code=403, detail="用户身份不匹配")
     except Exception as e:
-        logger.error(f"[会员订阅] 验证用户失败: {e}")
-        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+        logger.error(f"[会员订阅] 获取用户失败: {e}")
+        raise HTTPException(status_code=404, detail="用户不存在")
     
     # 3. 检查是否允许购买（禁止活跃会员降级购买）
     current_level = user.get("memberLevel", "normal")
@@ -223,8 +219,8 @@ async def simulate_pay(request: SimulatePayRequest):
     if order.get("status") == "paid":
         return SubscribeResponse(success=True, message="订单已支付")
     
-    # 执行订单完成逻辑（传递 session_token）
-    result = await complete_member_order(request.order_id, order, request.session_token)
+    # 执行订单完成逻辑（使用 Master Key 更新用户）
+    result = await complete_member_order(request.order_id, order)
     return result
 
 
@@ -265,21 +261,18 @@ async def wechat_callback(request_body: str):
 
 
 @router.get("/status/{user_id}", response_model=MemberStatusResponse)
-async def get_member_status(
-    user_id: str,
-    x_parse_session_token: Optional[str] = Header(None, alias="X-Parse-Session-Token")
-):
+async def get_member_status(user_id: str):
     """获取用户会员状态"""
-    if not x_parse_session_token:
-        raise HTTPException(status_code=401, detail="未提供会话令牌")
+    # 通过 JWT 认证验证用户身份
+    current_user_id = get_current_user_id()
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="无权访问此用户信息")
     
     try:
-        user = await parse_client.get_current_user(x_parse_session_token)
-        if user.get("objectId") != user_id:
-            raise HTTPException(status_code=403, detail="用户身份不匹配")
+        user = await parse_client.get_user(user_id)
     except Exception as e:
-        logger.error(f"[会员状态] 验证用户失败: {e}")
-        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+        logger.error(f"[会员状态] 获取用户失败: {e}")
+        raise HTTPException(status_code=404, detail="用户不存在")
     
     member_level = user.get("memberLevel", "normal")
     member_expire_at = user.get("memberExpireAt")
@@ -300,24 +293,12 @@ async def get_member_status(
 
 
 @router.get("/orders/{user_id}")
-async def get_member_orders(
-    user_id: str, 
-    limit: int = 20, 
-    skip: int = 0,
-    x_parse_session_token: Optional[str] = Header(None, alias="X-Parse-Session-Token")
-):
+async def get_member_orders(user_id: str, limit: int = 20, skip: int = 0):
     """获取用户会员订单列表"""
-    # 验证用户身份
-    if not x_parse_session_token:
-        raise HTTPException(status_code=401, detail="未提供会话令牌")
-    
-    try:
-        user = await parse_client.get_current_user(x_parse_session_token)
-        if user.get("objectId") != user_id:
-            raise HTTPException(status_code=403, detail="用户身份不匹配")
-    except Exception as e:
-        logger.error(f"[会员订单] 验证用户失败: {e}")
-        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+    # 通过 JWT 认证验证用户身份
+    current_user_id = get_current_user_id()
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="无权访问此用户订单")
     
     result = await parse_client.query_objects(
         "MemberOrder",
@@ -331,23 +312,14 @@ async def get_member_orders(
 
 
 @router.get("/order-status/{order_id}")
-async def get_order_status(
-    order_id: str,
-    x_parse_session_token: Optional[str] = Header(None, alias="X-Parse-Session-Token")
-):
+async def get_order_status(order_id: str):
     """
     查询订单支付状态（用于支付后轮询）
     
     真实支付流程中，前端展示二维码后需要轮询此接口检查支付结果
     """
-    if not x_parse_session_token:
-        raise HTTPException(status_code=401, detail="未提供会话令牌")
-    
-    try:
-        user = await parse_client.get_current_user(x_parse_session_token)
-    except Exception as e:
-        logger.error(f"[订单状态] 验证用户失败: {e}")
-        raise HTTPException(status_code=401, detail="会话已过期，请重新登录")
+    # 通过 JWT 认证
+    current_user_id = get_current_user_id()
     
     # 查询订单
     result = await parse_client.query_objects(
@@ -363,7 +335,7 @@ async def get_order_status(
     order = orders[0]
     
     # 验证订单属于当前用户
-    if order.get("userId") != user.get("objectId"):
+    if order.get("userId") != current_user_id:
         raise HTTPException(status_code=403, detail="无权访问此订单")
     
     # 如果订单状态是 pending，调用微信支付查询接口确认真实状态
@@ -390,166 +362,179 @@ async def get_order_status(
 
 # ============ 内部函数 ============
 
-async def complete_member_order(order_id: str, order: dict, session_token: Optional[str] = None) -> SubscribeResponse:
+async def complete_member_order(order_id: str, order: dict) -> SubscribeResponse:
     """
     完成会员订单（幂等）
     
-    1. 检查订单是否已处理（防止重复发放）
-    2. 更新订单状态
-    3. 更新用户会员等级和到期时间
-    4. 发放积分奖励
+    1. 使用 Redis 分布式锁防止并发重复处理
+    2. 检查订单是否已处理
+    3. 更新订单状态
+    4. 更新用户会员等级和到期时间（使用 Master Key）
+    5. 发放积分奖励（幂等）
     
     Args:
         order_id: 订单ID
         order: 订单数据
-        session_token: Parse session token，用于更新用户信息
     """
+    from app.core.redis_client import redis_client
+    
     user_id = order.get("userId")
     plan_id = order.get("planId")
     plan = MEMBER_PLANS.get(plan_id, {})
     
-    logger.info(f"[会员订单] 开始处理: order_id={order_id}, user_id={user_id}, plan_id={plan_id}, has_session={bool(session_token)}")
+    logger.info(f"[会员订单] 开始处理: order_id={order_id}, user_id={user_id}, plan_id={plan_id}")
     
-    # 0. 幂等性检查：重新查询订单状态，防止并发重复处理
+    # 0. 获取 Redis 分布式锁
+    lock_key = f"member_order_lock:{order_id}"
+    lock_acquired = await redis_client.setnx(lock_key, "1", ex=60)  # 60秒过期
+    
+    if not lock_acquired:
+        logger.warning(f"[会员订单] 订单正在处理中: {order_id}")
+        return SubscribeResponse(success=True, order_id=order_id, message="订单正在处理中")
+    
     try:
-        fresh_result = await parse_client.query_objects(
-            "MemberOrder",
-            where={"orderId": order_id},
-            limit=1,
-        )
-        fresh_orders = fresh_result.get("results", [])
-        if fresh_orders and fresh_orders[0].get("status") == "paid":
-            logger.info(f"[会员订单] 订单已处理，跳过: {order_id}")
-            return SubscribeResponse(success=True, order_id=order_id, message="订单已处理")
-    except Exception as e:
-        logger.warning(f"[会员订单] 幂等性检查失败，继续处理: {e}")
-    try:
-        await parse_client.query_and_update(
-            "MemberOrder",
-            {"orderId": order_id},
-            {
-                "status": "paid",
-                "paidAt": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        logger.info(f"[会员订单] 订单状态已更新为 paid")
-    except Exception as e:
-        logger.error(f"[会员订单] 更新订单状态失败: {e}")
-        return SubscribeResponse(success=False, message="更新订单失败")
-    
-    # 2. 获取用户当前状态
-    try:
-        if session_token:
-            user = await parse_client.get_current_user(session_token)
-            logger.info(f"[会员订单] 通过session获取用户成功: {user.get('username')}")
-        else:
-            logger.warning(f"[会员订单] 无session_token，尝试直接获取用户")
-            user = await parse_client.get_user(user_id)
-    except Exception as e:
-        logger.error(f"[会员订单] 获取用户失败: {e}")
-        return SubscribeResponse(success=False, message="用户不存在")
-    if not user:
-        logger.error(f"[会员订阅] 用户不存在: {user_id}")
-        return SubscribeResponse(success=False, message="用户不存在")
-    
-    # 3. 计算新的到期时间（简化方案）
-    # 规则：
-    # - 同等级续费：时间累加
-    # - 升级(VIP→SVIP)：折算剩余时间 + 新购时间
-    # - 降级(SVIP→VIP)：当前会员未过期时，禁止降级购买
-    # - 首次开通/已过期：直接购买
-    
-    current_expire = user.get("memberExpireAt")
-    current_level = user.get("memberLevel", "normal")
-    new_level = plan.get("level", "vip")
-    days = plan.get("days", 30)
-    
-    # 等级优先级: svip > vip > normal
-    LEVEL_PRIORITY = {"normal": 0, "vip": 1, "svip": 2}
-    current_priority = LEVEL_PRIORITY.get(current_level, 0)
-    new_priority = LEVEL_PRIORITY.get(new_level, 0)
-    
-    now = datetime.now(timezone.utc)
-    is_active = False  # 当前会员是否有效
-    
-    if current_expire:
-        expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
-        if expire_dt.tzinfo:
-            expire_dt = expire_dt.replace(tzinfo=None)
-        is_active = expire_dt > now
-    
-    # 检查是否为降级购买
-    if is_active and new_priority < current_priority:
-        # 高等级会员未过期，禁止购买低等级
-        logger.warning(f"[会员订阅] 禁止降级: 当前{current_level}未过期({expire_dt.date()})，不能购买{new_level}")
-        return SubscribeResponse(
-            success=False, 
-            message=f"您当前是{current_level.upper()}会员，有效期至{expire_dt.date()}，请等到期后再购买{new_level.upper()}"
-        )
-    
-    # 计算新到期时间
-    if is_active:
-        remaining_days = (expire_dt - now).days
+        # 1. 幂等性检查：重新查询订单状态
+        try:
+            fresh_result = await parse_client.query_objects(
+                "MemberOrder",
+                where={"orderId": order_id},
+                limit=1,
+            )
+            fresh_orders = fresh_result.get("results", [])
+            if fresh_orders and fresh_orders[0].get("status") == "paid":
+                logger.info(f"[会员订单] 订单已处理，跳过: {order_id}")
+                return SubscribeResponse(success=True, order_id=order_id, message="订单已处理")
+        except Exception as e:
+            logger.warning(f"[会员订单] 幂等性检查失败，继续处理: {e}")
         
-        if current_level == new_level:
-            # 同等级续费，时间直接累加
-            new_expire = expire_dt + timedelta(days=days)
-            logger.info(f"[会员订阅] 同等级续费: 剩余{remaining_days}天 + 新购{days}天")
+        # 2. 检查积分是否已发放（通过 order_id 查询 IncentiveLog）
+        try:
+            existing_incentive = await parse_client.query_objects(
+                "IncentiveLog",
+                where={
+                    "userId": user_id,
+                    "type": "member_subscribe",
+                    "description": {"$regex": order_id}
+                },
+                limit=1,
+            )
+            if existing_incentive.get("results"):
+                logger.info(f"[会员订单] 积分已发放，跳过: {order_id}")
+                return SubscribeResponse(success=True, order_id=order_id, message="订单已处理")
+        except Exception as e:
+            logger.warning(f"[会员订单] 积分检查失败，继续处理: {e}")
+        
+        # 3. 更新订单状态
+        try:
+            await parse_client.query_and_update(
+                "MemberOrder",
+                {"orderId": order_id},
+                {
+                    "status": "paid",
+                    "paidAt": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            logger.info(f"[会员订单] 订单状态已更新为 paid")
+        except Exception as e:
+            logger.error(f"[会员订单] 更新订单状态失败: {e}")
+            return SubscribeResponse(success=False, message="更新订单失败")
+        
+        # 4. 获取用户当前状态
+        try:
+            user = await parse_client.get_user(user_id)
+            logger.info(f"[会员订单] 获取用户成功: {user.get('username')}")
+        except Exception as e:
+            logger.error(f"[会员订单] 获取用户失败: {e}")
+            return SubscribeResponse(success=False, message="用户不存在")
+        
+        if not user:
+            logger.error(f"[会员订阅] 用户不存在: {user_id}")
+            return SubscribeResponse(success=False, message="用户不存在")
+        
+        # 5. 计算新的到期时间（简化方案）
+        current_expire = user.get("memberExpireAt")
+        current_level = user.get("memberLevel", "normal")
+        new_level = plan.get("level", "vip")
+        days = plan.get("days", 30)
+        
+        LEVEL_PRIORITY = {"normal": 0, "vip": 1, "svip": 2}
+        current_priority = LEVEL_PRIORITY.get(current_level, 0)
+        new_priority = LEVEL_PRIORITY.get(new_level, 0)
+        
+        now = datetime.now(timezone.utc)
+        is_active = False
+        
+        if current_expire:
+            expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
+            if expire_dt.tzinfo:
+                expire_dt = expire_dt.replace(tzinfo=None)
+            is_active = expire_dt > now
+        
+        # 检查是否为降级购买
+        if is_active and new_priority < current_priority:
+            logger.warning(f"[会员订阅] 禁止降级: 当前{current_level}未过期({expire_dt.date()})，不能购买{new_level}")
+            return SubscribeResponse(
+                success=False, 
+                message=f"您当前是{current_level.upper()}会员，有效期至{expire_dt.date()}，请等到期后再购买{new_level.upper()}"
+            )
+        
+        # 计算新到期时间
+        if is_active:
+            remaining_days = (expire_dt - now).days
+            
+            if current_level == new_level:
+                new_expire = expire_dt + timedelta(days=days)
+                logger.info(f"[会员订阅] 同等级续费: 剩余{remaining_days}天 + 新购{days}天")
+            else:
+                PRICE_RATIO = {"vip": 1.0, "svip": 2.0}
+                current_ratio = PRICE_RATIO.get(current_level, 1.0)
+                new_ratio = PRICE_RATIO.get(new_level, 1.0)
+                converted_days = int(remaining_days * current_ratio / new_ratio)
+                new_expire = now + timedelta(days=converted_days + days)
+                logger.info(f"[会员订阅] 升级: {current_level}->{new_level}, "
+                           f"剩余{remaining_days}天折算为{converted_days}天 + 新购{days}天")
         else:
-            # 升级：折算剩余时间 + 新购时间
-            # VIP→SVIP: VIP剩余时间按1:2折算（因为SVIP是VIP 2倍价格）
-            # 例: 30天VIP = 15天SVIP
-            PRICE_RATIO = {"vip": 1.0, "svip": 2.0}
-            current_ratio = PRICE_RATIO.get(current_level, 1.0)
-            new_ratio = PRICE_RATIO.get(new_level, 1.0)
-            converted_days = int(remaining_days * current_ratio / new_ratio)
-            new_expire = now + timedelta(days=converted_days + days)
-            logger.info(f"[会员订阅] 升级: {current_level}->{new_level}, "
-                       f"剩余{remaining_days}天折算为{converted_days}天 + 新购{days}天")
-    else:
-        # 首次开通或已过期，从现在开始
-        new_expire = now + timedelta(days=days)
-        logger.info(f"[会员订阅] {'首次开通' if not current_expire else '会员已过期'}，{days}天")
-    
-    # 4. 更新用户会员状态
-    update_data = {
-        "memberLevel": new_level,
-        "memberExpireAt": new_expire.isoformat(),
-    }
-    
-    try:
-        if session_token:
-            await parse_client.update_user_with_session(user_id, update_data, session_token)
-            logger.info(f"[会员订单] 使用session更新用户成功")
-        else:
+            new_expire = now + timedelta(days=days)
+            logger.info(f"[会员订阅] {'首次开通' if not current_expire else '会员已过期'}，{days}天")
+        
+# 6. 更新用户会员状态（使用 Master Key）
+        try:
             await parse_client.update_user_with_master_key(user_id, update_data)
             logger.info(f"[会员订单] 使用MasterKey更新用户成功")
-    except Exception as e:
-        logger.error(f"[会员订单] 更新用户会员状态失败: {e}")
-        return SubscribeResponse(success=False, message="更新会员状态失败")
-    
-    logger.info(f"[会员订阅] 用户 {user_id} 会员等级: {new_level}，到期时间: {new_expire}")
-    
-    # 5. 发放积分奖励
-    bonus = plan.get("bonus", 0)
-    if bonus > 0:
-        try:
-            reward_result = await incentive_service.grant_member_subscribe_reward(
-                user_id=user_id,
-                plan_name=plan.get('name', plan_id),
-                member_level=new_level,
-                order_id=order_id,
-                bonus=bonus,
-            )
-            if reward_result.get("success"):
-                logger.info(f"[会员订阅] 发放积分奖励成功: {user_id}, {bonus}积分")
-            else:
-                logger.warning(f"[会员订阅] 发放积分奖励失败: {user_id}, 原因: {reward_result.get('error')}")
         except Exception as e:
-            logger.error(f"[会员订阅] 发放积分异常: {e}")
+            logger.error(f"[会员订单] 更新用户会员状态失败: {e}")
+            return SubscribeResponse(success=False, message="更新会员状态失败")
+        
+        logger.info(f"[会员订阅] 用户 {user_id} 会员等级: {new_level}，到期时间: {new_expire}")
+        
+        # 7. 发放积分奖励
+        bonus = plan.get("bonus", 0)
+        if bonus > 0:
+            try:
+                reward_result = await incentive_service.grant_member_subscribe_reward(
+                    user_id=user_id,
+                    plan_name=plan.get('name', plan_id),
+                    member_level=new_level,
+                    order_id=order_id,
+                    bonus=bonus,
+                )
+                if reward_result.get("success"):
+                    logger.info(f"[会员订阅] 发放积分奖励成功: {user_id}, {bonus}积分")
+                else:
+                    logger.warning(f"[会员订阅] 发放积分奖励失败: {user_id}, 原因: {reward_result.get('error')}")
+            except Exception as e:
+                logger.error(f"[会员订阅] 发放积分异常: {e}")
+        
+        return SubscribeResponse(
+            success=True,
+            order_id=order_id,
+            message=f"订阅成功，已升级为{new_level}会员",
+        )
     
-    return SubscribeResponse(
-        success=True,
-        order_id=order_id,
-        message=f"订阅成功，已升级为{new_level}会员",
-    )
+    finally:
+        # 释放 Redis 分布式锁
+        try:
+            await redis_client.delete(lock_key)
+            logger.debug(f"[会员订单] 释放分布式锁: {lock_key}")
+        except Exception as e:
+            logger.warning(f"[会员订单] 释放锁失败: {e}")

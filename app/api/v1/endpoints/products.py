@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from app.core.parse_client import parse_client
 from app.core.email_client import email_client
-from app.core.deps import get_current_user_id, get_admin_user_id
+from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_user_id
 
 router = APIRouter()
 
@@ -69,10 +69,10 @@ AUTO_OFFLINE_THRESHOLD = 5
 @router.post("/review")
 async def review_product(
     request: ReviewProductRequest,
-    admin_id: str = Depends(get_admin_user_id)
+    user_id: str = Depends(get_operator_user_id)
 ):
     """
-    审核商品(管理员)
+    审核商品(管理员/运营人员)
     """
     # 获取商品
     try:
@@ -84,7 +84,7 @@ async def review_product(
     update_data = {
         "status": request.status,
         "reviewedAt": datetime.now(timezone.utc).isoformat(),
-        "reviewedBy": admin_id,
+        "reviewedBy": user_id,
     }
     if request.review_note:
         update_data["reviewNote"] = request.review_note
@@ -94,7 +94,7 @@ async def review_product(
     # 创建审核记录
     await parse_client.create_object("ProductReview", {
         "productId": request.product_id,
-        "adminId": admin_id,
+        "operatorId": user_id,
         "status": request.status,
         "note": request.review_note,
     })
@@ -124,17 +124,17 @@ async def review_product(
 @router.post("/batch-review")
 async def batch_review_products(
     request: BatchReviewRequest,
-    admin_id: str = Depends(get_admin_user_id)
+    user_id: str = Depends(get_operator_user_id)
 ):
     """
-    批量审核商品(管理员) - 并发执行
+    批量审核商品(管理员/运营人员) - 并发执行
     """
     async def _review_one(product_id: str) -> dict:
         try:
             await parse_client.update_object("Product", product_id, {
                 "status": request.status,
                 "reviewedAt": datetime.now(timezone.utc).isoformat(),
-                "reviewedBy": admin_id,
+                "reviewedBy": user_id,
                 "reviewNote": request.review_note,
             })
             return {"product_id": product_id, "success": True}
@@ -206,7 +206,7 @@ async def get_pending_products(
     page: int = 1,
     limit: int = 20,
     category: Optional[str] = None,
-    admin_id: str = Depends(get_admin_user_id)
+    user_id: str = Depends(get_operator_user_id)
 ):
     """
     获取待审核商品列表
@@ -338,7 +338,7 @@ async def process_report(
 
 
 @router.get("/stats")
-async def get_product_stats(admin_id: str = Depends(get_admin_user_id)):
+async def get_product_stats(user_id: str = Depends(get_operator_user_id)):
     """
     获取商品统计数据(管理员)
     """

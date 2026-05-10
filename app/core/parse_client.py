@@ -200,10 +200,13 @@ class ParseClient:
     
     async def get_user(self, user_id: str) -> Dict[str, Any]:
         """获取用户信息（使用 Master Key）"""
+        logger.info(f"[Parse] get_user called with user_id: {user_id}")
         url = f"{self.base_url}/users/{user_id}"
         client = await self._get_master_client()
         try:
+            logger.info(f"[Parse] get_user URL: {url}")
             response = await client.get(url)
+            logger.info(f"[Parse] get_user response: {response.status_code} - {response.text[:100]}")
             if response.status_code >= 400:
                 logger.error(f"[Parse] 获取用户失败: {response.text}")
             response.raise_for_status()
@@ -344,6 +347,22 @@ class ParseClient:
         import json
         params = {"limit": limit, "skip": skip}
         if where:
+            # PostgreSQL 不支持 $or 查询，改用两次查询
+            if "$or" in where:
+                or_conditions = where["$or"]
+                results = []
+                for cond in or_conditions:
+                    single_params = {"limit": limit, "skip": 0, "where": json.dumps(cond)}
+                    url = f"{self.base_url}/classes/_User"
+                    client = await self._get_master_client()
+                    try:
+                        response = await client.get(url, params=single_params)
+                        if response.status_code == 200:
+                            data = response.json()
+                            results.extend(data.get("results", []))
+                    except Exception:
+                        pass
+                return {"results": results[:limit]}
             params["where"] = json.dumps(where)
         if order:
             params["order"] = order
@@ -415,6 +434,8 @@ class ParseClient:
             "reviewedBy": {"type": "String"},
             "reviewNote": {"type": "String"},
             "offlineReason": {"type": "String"},
+            "copyright": {"type": "String"},
+            "license": {"type": "String"},
         },
         "MemberOrder": {
             "orderId": {"type": "String"},
@@ -533,6 +554,9 @@ class ParseClient:
             "views": {"type": "Number"},
             "isListed": {"type": "Boolean"},
             "tags": {"type": "Array"},
+            "copyright": {"type": "String"},
+            "license": {"type": "String"},
+            "assetUrl": {"type": "String"},
         },
         # 评论
         "Comment": {
@@ -543,6 +567,7 @@ class ParseClient:
             "content": {"type": "String"},
             "rating": {"type": "Number"},
             "parentId": {"type": "String"},
+            "replyToId": {"type": "String"},  # 回复的用户ID
             "likeCount": {"type": "Number"},
         },
         # 点赞
@@ -624,12 +649,18 @@ class ParseClient:
         },
         # 平台账户明细
         "AccountRecord": {
+            "userId": {"type": "String"},
             "type": {"type": "String"},
             "category": {"type": "String"},
             "amount": {"type": "Number"},
+            "balance_before": {"type": "Number"},
+            "balance_after": {"type": "Number"},
             "balance": {"type": "Number"},
             "description": {"type": "String"},
             "relatedOrderNo": {"type": "String"},
+            "operator_id": {"type": "String"},
+            "operator_name": {"type": "String"},
+            "createdAt": {"type": "String"},
         },
         # 系统配置
         "SystemConfig": {
@@ -793,7 +824,7 @@ class ParseClient:
         """确保默认管理员和运营用户存在"""
         default_users = [
             {"username": "admin", "password": "Admin@123456", "email": "admin@aigccloud.com", "role": "admin", "level": 99, "emailVerified": True},
-            {"username": "operator", "password": "Operator@123456", "email": "operator@aigccloud.com", "role": "admin", "level": 50, "emailVerified": True},
+            {"username": "operator", "password": "Operator@123456", "email": "operator@aigccloud.com", "role": "operator", "level": 50, "emailVerified": True},
         ]
         client = await self._get_master_client()
         for user_data in default_users:

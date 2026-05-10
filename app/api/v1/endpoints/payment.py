@@ -119,7 +119,19 @@ async def create_order(
         description = f"充值{amount}元"
         coins = int(amount * 100)  # 1元 = 100金币
     elif request.type == "purchase":
-        description = "购买商品"
+        if not request.product_id:
+            raise HTTPException(status_code=400, detail="购买商品需要提供商品ID")
+        try:
+            product = await parse_client.get_object("Product", request.product_id)
+        except Exception:
+            raise HTTPException(status_code=404, detail="商品不存在")
+        
+        product_status = product.get("status")
+        if product_status not in ("approved", "active"):
+            raise HTTPException(status_code=400, detail="商品不可购买")
+        
+        amount = product.get("price", 0)
+        description = product.get("name", "购买商品")
     
     # 生成订单号
     order_no = generate_order_no()
@@ -252,6 +264,9 @@ async def cancel_order(order_id: str):
 
 # ============ Web3转账验证（核心） ============
 
+# 最少确认数（以太坊主网建议6个确认）
+MIN_CONFIRMATIONS = 6
+
 async def _verify_tx_status(tx_hash: str, buyer_address: str, seller_address: str, amount: int) -> dict:
     """查询交易状态"""
     return await web3_client.verify_transfer(
@@ -262,13 +277,13 @@ async def _verify_tx_status(tx_hash: str, buyer_address: str, seller_address: st
     )
 
 
-async def _poll_tx_until_confirmed(tx_hash: str, buyer_address: str, seller_address: str, amount: int, max_retries: int = 3, interval: int = 10) -> dict:
+async def _poll_tx_until_confirmed(tx_hash: str, buyer_address: str, seller_address: str, amount: int, max_retries: int = 30, interval: int = 10) -> dict:
     """
     轮询交易状态直到确认
     
     Args:
         tx_hash: 交易hash
-        max_retries: 最大重试次数（默认3次）
+        max_retries: 最大重试次数（默认30次，5分钟）
         interval: 每次等待秒数（默认10秒）
     
     Returns:
@@ -279,10 +294,22 @@ async def _poll_tx_until_confirmed(tx_hash: str, buyer_address: str, seller_addr
         
         verify_result = await _verify_tx_status(tx_hash, buyer_address, seller_address, amount)
         tx_status = verify_result.get("tx_status", "error")
+        confirmations = verify_result.get("confirmations", 0)
         
         if tx_status == "confirmed":
-            logger.info(f"[轮询txHash] 交易已确认: {tx_hash[:16]}...")
-            return verify_result
+            # 检查确认数，避免交易回滚
+            if confirmations >= MIN_CONFIRMATIONS:
+                logger.info(f"[轮询txHash] 交易已确认且足够安全: {tx_hash[:16]}... (确认数: {confirmations})")
+                return verify_result
+            elif confirmations > 0:
+                # 确认数不足，继续等待
+                logger.info(f"[轮询txHash] 交易已确认但确认数不足: {confirmations}/{MIN_CONFIRMATIONS}，等待{interval}秒后重试...")
+                await asyncio.sleep(interval)
+                continue
+            else:
+                # 没有确认数信息，但状态是confirmed，直接返回
+                logger.info(f"[轮询txHash] 交易已确认: {tx_hash[:16]}...")
+                return verify_result
         
         if tx_status == "failed":
             logger.warning(f"[轮询txHash] 交易失败: {tx_hash[:16]}...")
@@ -294,7 +321,7 @@ async def _poll_tx_until_confirmed(tx_hash: str, buyer_address: str, seller_addr
         
         # pending 状态，等待后继续轮询
         if i < max_retries - 1:
-            logger.info(f"[轮询txHash] 交易待确认，等待{interval}秒后重试...")
+            logger.info(f"[轮询txHash] 交易待确认 ({confirmations}/{MIN_CONFIRMATIONS})，等待{interval}秒后重试...")
             await asyncio.sleep(interval)
     
     # 轮询结束仍未确认，返回最后一次结果
@@ -532,7 +559,9 @@ async def mock_pay_order(order_id: str):
 
 # ============ 后台协程：处理支付中订单 ============
 
-_background_task_running = False
+# Redis 分布式锁键名
+_BACKGROUND_TASK_LOCK_KEY = "background_order_processor_lock"
+_BACKGROUND_TASK_LOCK_EXPIRE = 60  # 锁过期时间 60 秒
 
 async def process_pending_paid_orders():
     """
@@ -628,13 +657,6 @@ async def background_order_processor(interval: int = 60):
     Args:
         interval: 每次处理间隔（秒），默认60秒
     """
-    global _background_task_running
-    
-    if _background_task_running:
-        logger.warning("[后台任务] 已经在运行，跳过")
-        return
-    
-    _background_task_running = True
     logger.info(f"[后台任务] 启动订单处理器，间隔: {interval}秒")
     
     try:
@@ -643,11 +665,27 @@ async def background_order_processor(interval: int = 60):
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("[后台任务] 订单处理器已停止")
-    finally:
-        _background_task_running = False
 
 
-def start_background_order_processor():
-    """启动后台订单处理器"""
+async def start_background_order_processor():
+    """
+    启动后台订单处理器
+    使用 Redis 分布式锁确保只有一个实例在运行
+    """
+    import asyncio
+    
+    # 尝试获取分布式锁
+    lock_acquired = await redis_client.setnx(
+        _BACKGROUND_TASK_LOCK_KEY, 
+        "1", 
+        ex=_BACKGROUND_TASK_LOCK_EXPIRE
+    )
+    
+    if not lock_acquired:
+        logger.info("[后台任务] 订单处理器已在其他进程运行，跳过")
+        return
+    
+    logger.info("[后台任务] 获取分布式锁成功，启动订单处理器")
+    
+    # 创建后台任务
     asyncio.create_task(background_order_processor(interval=300))  # 5分钟间隔
-    logger.info("[后台任务] 订单处理器已加入任务队列")

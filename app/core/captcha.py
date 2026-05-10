@@ -1,6 +1,7 @@
 """
 图片验证码服务
 """
+import base64
 import io
 import random
 import string
@@ -82,27 +83,30 @@ class CaptchaService:
     """验证码服务"""
     
     @staticmethod
-    async def generate() -> Tuple[str, bytes]:
-        """
-        生成验证码
+    async def generate() -> Tuple[str, str]:
+        """生成验证码
         
         Returns:
-            (captcha_id, image_bytes)
+            (captcha_id, image_base64)
         """
         # 生成验证码ID和文本
         captcha_id = str(uuid.uuid4())
         captcha_text = generate_captcha_text()
         
-        # 存储到 Redis
+        # 生成图片
+        image_bytes = generate_captcha_image(captcha_text)
+        
+        # 转换为 base64
+        image_base64 = base64.b64encode(image_bytes).decode()
+        image_data = f"data:image/png;base64,{image_base64}"
+        
+        # 存储验证码文本到 Redis
         key = f"captcha:{captcha_id}"
         await redis_client.set(key, captcha_text, ex=CAPTCHA_EXPIRE)
         
         logger.info(f"[Captcha] 生成验证码: id={captcha_id}, text={captcha_text}")
         
-        # 生成图片
-        image_bytes = generate_captcha_image(captcha_text)
-        
-        return captcha_id, image_bytes
+        return captcha_id, image_data
     
     @staticmethod
     async def verify(captcha_id: str, captcha_text: str) -> bool:

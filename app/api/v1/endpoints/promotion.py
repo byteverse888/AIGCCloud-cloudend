@@ -189,7 +189,7 @@ async def bind_inviter(
     
     # 查找邀请人
     inviters = await parse_client.query_users(
-        where={"objectId": {"$regex": f"^{invite_code}"}}
+        where={"objectId": invite_code}
     )
     
     if not inviters.get("results"):
