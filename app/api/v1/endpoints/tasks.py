@@ -1117,3 +1117,295 @@ async def convert_task_to_asset(
         "skipped_count": skipped_count,
         "message": message,
     }
+
+
+# ============ 边缘节点批次化调度 API ============
+
+class BatchClaimRequest(BaseModel):
+    task_types: Optional[List[str]] = None  # 为空表示拉取所有类型
+    limit: int = 20                          # 默认 20，上限 100
+    executor_address: str                    # 执行者 Web3 地址
+
+
+class BatchClaimedTask(BaseModel):
+    task_id: str
+    type: str
+    model: str
+    data: Optional[Dict[str, Any]] = None
+    priority: int = 0
+    cost: Optional[float] = 0
+    created_at: Optional[str] = None
+
+
+class BatchClaimResponse(BaseModel):
+    success: bool
+    claimed: int
+    tasks: List[BatchClaimedTask]
+
+
+class BatchCompletionItem(BaseModel):
+    task_id: str
+    status: str                              # success | failed | timeout
+    result_url: Optional[str] = None
+    cid: Optional[str] = None
+    error_message: Optional[str] = None
+    processing_time: Optional[float] = None
+    completed_at: Optional[str] = None
+
+
+class BatchCompleteRequest(BaseModel):
+    executor_address: str
+    completions: List[BatchCompletionItem]
+
+
+class BatchCompleteItemResult(BaseModel):
+    task_id: str
+    ok: bool
+    status: str                              # REWARDED | COMPLETED | FAILED | SKIPPED
+    reward_amount: Optional[float] = None
+    error: Optional[str] = None
+
+
+class BatchCompleteResponse(BaseModel):
+    success: bool
+    total: int
+    success_count: int
+    failed_count: int
+    results: List[BatchCompleteItemResult]
+
+
+@router.post("/node/batch-claim", response_model=BatchClaimResponse)
+async def batch_claim_tasks(
+    request: BatchClaimRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    边缘节点批量认领任务
+
+    流程:
+    1. 查询 status=PENDING 且未被认领(executor 为空) 的任务
+    2. 按 priority DESC, createdAt ASC 排序
+    3. 逐个尝试原子更新 (status -> PROCESSING, executor=地址, claimedAt=现在)
+       失败的跳过, 避免并发抢单冲突
+    4. 返回成功认领的任务数据
+    """
+    limit = max(1, min(int(request.limit or 20), 100))
+    executor_address = (request.executor_address or "").strip()
+    if not executor_address:
+        raise HTTPException(status_code=400, detail="executor_address 不能为空")
+
+    where: Dict[str, Any] = {
+        "status": TaskStatus.PENDING.value,
+        "$or": [
+            {"executor": {"$exists": False}},
+            {"executor": None},
+            {"executor": ""},
+        ],
+    }
+    if request.task_types:
+        where["type"] = {"$in": list(request.task_types)}
+
+    # 多拉取一些作为备选, 避免认领冲突后实际返回不足
+    query_result = await parse_client.query_objects(
+        "AITask",
+        where=where,
+        order="-priority,createdAt",
+        limit=limit * 2,
+    )
+    candidates = query_result.get("results", []) or []
+
+    claimed: List[BatchClaimedTask] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for task in candidates:
+        if len(claimed) >= limit:
+            break
+        object_id = task.get("objectId")
+        task_id = task.get("taskId")
+        if not object_id or not task_id:
+            continue
+
+        # 再次确认任务仍可被认领, 存在并发已被其他节点拿走的情况
+        try:
+            fresh = await parse_client.get_object("AITask", object_id)
+            if (fresh.get("status") != TaskStatus.PENDING.value
+                    or (fresh.get("executor") or "").strip()):
+                continue
+        except Exception as e:
+            logger.warning(f"[batch-claim] 刷新任务失败 {task_id}: {e}")
+            continue
+
+        update_payload = {
+            "status": TaskStatus.PROCESSING.value,
+            "executor": executor_address,
+            "claimedAt": now_iso,
+        }
+        try:
+            await parse_client.update_object("AITask", object_id, update_payload)
+        except Exception as e:
+            logger.warning(f"[batch-claim] 认领失败 {task_id}: {e}")
+            continue
+
+        claimed.append(BatchClaimedTask(
+            task_id=task_id,
+            type=task.get("type", ""),
+            model=task.get("model", ""),
+            data=task.get("data") or {},
+            priority=int(task.get("priority") or 0),
+            cost=float(task.get("cost") or 0),
+            created_at=task.get("createdAt"),
+        ))
+
+    logger.info(
+        f"[batch-claim] user={user_id} executor={executor_address} "
+        f"requested={limit} claimed={len(claimed)}"
+    )
+
+    return BatchClaimResponse(
+        success=True,
+        claimed=len(claimed),
+        tasks=claimed,
+    )
+
+
+@router.post("/node/batch-complete", response_model=BatchCompleteResponse)
+async def batch_complete_tasks(
+    request: BatchCompleteRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    边缘节点批量回传任务完成状态
+
+    对每条 completion:
+    - success: 更新为 COMPLETED, 发放积分 (grant_task_reward 幂等), 最终 REWARDED
+    - failed/timeout: 更新为 FAILED, 记录 errorMessage
+    """
+    executor_address = (request.executor_address or "").strip()
+    if not executor_address:
+        raise HTTPException(status_code=400, detail="executor_address 不能为空")
+
+    completions = request.completions or []
+    if not completions:
+        raise HTTPException(status_code=400, detail="completions 不能为空")
+
+    # 查出执行者用户一次, 后面批量复用
+    executor_user_id: Optional[str] = None
+    try:
+        executor_users = await parse_client.query_users(
+            where={"web3Address": {"$regex": f"(?i)^{executor_address}$"}}
+        )
+        if executor_users.get("results"):
+            executor_user_id = executor_users["results"][0].get("objectId")
+    except Exception as e:
+        logger.warning(f"[batch-complete] 查询执行者用户失败: {e}")
+
+    results: List[BatchCompleteItemResult] = []
+    success_count = 0
+    failed_count = 0
+
+    for item in completions:
+        task_id = item.task_id
+        try:
+            # 查询任务
+            query = await parse_client.query_objects("AITask", where={"taskId": task_id}, limit=1)
+            task_list = query.get("results", []) or []
+            if not task_list:
+                results.append(BatchCompleteItemResult(
+                    task_id=task_id, ok=False, status="SKIPPED", error="任务不存在"
+                ))
+                failed_count += 1
+                continue
+
+            task = task_list[0]
+            object_id = task["objectId"]
+            current_status = task.get("status")
+
+            # 幂等: 已发放奖励直接返回成功
+            if current_status == TaskStatus.REWARDED.value:
+                results.append(BatchCompleteItemResult(
+                    task_id=task_id, ok=True, status="REWARDED",
+                    reward_amount=float(task.get("rewardAmount") or 0),
+                ))
+                success_count += 1
+                continue
+
+            completed_at_iso = item.completed_at or datetime.now(timezone.utc).isoformat()
+
+            if item.status == "success":
+                # 构造结果 (仅使用 url/cid 记录, 不做 IPFS/Rustfs 二次处理, 由节点自行保证可访问)
+                verified_results: List[Dict[str, Any]] = []
+                if item.result_url or item.cid:
+                    verified_results.append({
+                        "CID": item.cid,
+                        "url": item.result_url or "",
+                        "thumbnail": item.result_url,
+                    })
+                update_data = {
+                    "status": TaskStatus.COMPLETED.value,
+                    "executor": executor_address,
+                    "results": verified_results,
+                    "completedAt": completed_at_iso,
+                }
+                if item.processing_time is not None:
+                    update_data["processingTime"] = float(item.processing_time)
+                await parse_client.update_object("AITask", object_id, update_data)
+
+                # 发放积分 (幂等 related_id=task_id)
+                reward_amount = 1.0
+                rewarded = False
+                if executor_user_id:
+                    reward_result = await incentive_service.grant_task_reward(
+                        user_id=executor_user_id,
+                        task_id=task_id,
+                        task_type=task.get("type", "unknown"),
+                        amount=reward_amount,
+                    )
+                    if reward_result.get("success"):
+                        rewarded = True
+                        await parse_client.update_object("AITask", object_id, {
+                            "status": TaskStatus.REWARDED.value,
+                            "rewardAmount": reward_amount,
+                        })
+
+                results.append(BatchCompleteItemResult(
+                    task_id=task_id, ok=True,
+                    status="REWARDED" if rewarded else "COMPLETED",
+                    reward_amount=reward_amount if rewarded else None,
+                ))
+                success_count += 1
+            else:
+                # failed / timeout
+                update_data = {
+                    "status": TaskStatus.FAILED.value,
+                    "executor": executor_address,
+                    "errorMessage": item.error_message or f"executor reported {item.status}",
+                    "completedAt": completed_at_iso,
+                }
+                if item.processing_time is not None:
+                    update_data["processingTime"] = float(item.processing_time)
+                await parse_client.update_object("AITask", object_id, update_data)
+                results.append(BatchCompleteItemResult(
+                    task_id=task_id, ok=True, status="FAILED"
+                ))
+                failed_count += 1
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception(f"[batch-complete] 处理 {task_id} 失败: {e}")
+            results.append(BatchCompleteItemResult(
+                task_id=task_id, ok=False, status="SKIPPED", error=str(e)
+            ))
+            failed_count += 1
+
+    logger.info(
+        f"[batch-complete] user={user_id} executor={executor_address} "
+        f"total={len(completions)} success={success_count} failed={failed_count}"
+    )
+
+    return BatchCompleteResponse(
+        success=True,
+        total=len(completions),
+        success_count=success_count,
+        failed_count=failed_count,
+        results=results,
+    )
