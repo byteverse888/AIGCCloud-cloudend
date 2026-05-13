@@ -1194,55 +1194,138 @@ async def batch_claim_tasks(
     if not executor_address:
         raise HTTPException(status_code=400, detail="executor_address 不能为空")
 
+    # Parse 查询只做粗筛：status + 可选 type。
+    # executor / excutor 空值判断放到 Python 侧遍历时做，
+    # 避免 Parse Server 嵌套 $and+$or 语法在部分版本中的兵容问题
     where: Dict[str, Any] = {
         "status": TaskStatus.PENDING.value,
-        "$or": [
-            {"executor": {"$exists": False}},
-            {"executor": None},
-            {"executor": ""},
-        ],
     }
     if request.task_types:
         where["type"] = {"$in": list(request.task_types)}
 
-    # 多拉取一些作为备选, 避免认领冲突后实际返回不足
+    # 多拉取一些作为备选, 避免并发认领冲突 + Python 侧过滤后实际返回不足
     query_result = await parse_client.query_objects(
         "AITask",
         where=where,
         order="-priority,createdAt",
-        limit=limit * 2,
+        limit=limit * 5,
     )
-    candidates = query_result.get("results", []) or []
+    raw_results = query_result.get("results", []) or []
+
+    # 诊断：如果粗筛为 0，额外跑两次排查查询 ——
+    # A. 只按 status=PENDING 查，看比 type 过滤后多少，确认 type 值实际是什么
+    # B. 不加任何过滤，看表里底岂还有没有数据 + status 实际存储类型
+    if not raw_results:
+        try:
+            probe_status = await parse_client.query_objects(
+                "AITask", where={"status": TaskStatus.PENDING.value}, limit=5,
+            )
+            probe_rows = probe_status.get("results", []) or []
+            logger.info(
+                f"[batch-claim][probe] status-only hit={len(probe_rows)} "
+                f"sample_types={[r.get('type') for r in probe_rows[:5]]}"
+            )
+
+            probe_any = await parse_client.query_objects("AITask", where={}, limit=3)
+            any_rows = probe_any.get("results", []) or []
+            logger.info(
+                f"[batch-claim][probe] any hit={len(any_rows)} "
+                f"sample=" + "; ".join(
+                    f"objectId={r.get('objectId')} "
+                    f"status={r.get('status')!r}({type(r.get('status')).__name__}) "
+                    f"type={r.get('type')!r}"
+                    for r in any_rows[:3]
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[batch-claim][probe] 诊断查询失败: {e}")
+
+    # Python 侧过滤：executor 和 excutor 两个字段都必须为空才视为未认领
+    def _is_empty(val: Any) -> bool:
+        if val is None:
+            return True
+        if isinstance(val, str):
+            return not val.strip()
+        return False
+
+    candidates = [
+        t for t in raw_results
+        if _is_empty(t.get("executor")) and _is_empty(t.get("excutor"))
+    ]
+    logger.info(
+        f"[batch-claim] query types={list(request.task_types) if request.task_types else 'ALL'} "
+        f"raw={len(raw_results)} candidates={len(candidates)}"
+    )
 
     claimed: List[BatchClaimedTask] = []
     now_iso = datetime.now(timezone.utc).isoformat()
+    # 诊断统计：方便定位 "candidates 不为 0 但 claimed=0" 的真相
+    skipped_stale = 0    # 二次校验时状态或 executor 不符合
+    skipped_refresh_fail = 0  # get_object 异常
+    skipped_update_fail = 0   # update_object 异常
+    skipped_missing_id = 0    # objectId / taskId 字段缺失
+    sample_logged = 0         # 采样打印前几条详细状态方便诊断
+
+    # 采样打印首条候选的字段名，定位 taskId 实际存储的字段名
+    if candidates:
+        first = candidates[0]
+        logger.info(
+            f"[batch-claim] candidate[0] keys={list(first.keys())} "
+            f"objectId={first.get('objectId')!r} taskId={first.get('taskId')!r} "
+            f"task_id={first.get('task_id')!r}"
+        )
 
     for task in candidates:
         if len(claimed) >= limit:
             break
         object_id = task.get("objectId")
-        task_id = task.get("taskId")
-        if not object_id or not task_id:
+        if not object_id:
+            # Parse 返回数据必带 objectId，理论上不会进此分支
+            skipped_missing_id += 1
             continue
+        # 统一使用 objectId 作为 task_id 向客户端返回：
+        # - 新任务不再依赖 generate_task_id() 的业务 ID
+        # - 老任务比如有 taskId 也忽略，统一用 Parse 主键，避免两套 ID
+        task_id = object_id
 
         # 再次确认任务仍可被认领, 存在并发已被其他节点拿走的情况
         try:
             fresh = await parse_client.get_object("AITask", object_id)
-            if (fresh.get("status") != TaskStatus.PENDING.value
-                    or (fresh.get("executor") or "").strip()):
+            fresh_status = fresh.get("status")
+            # 同时检查 executor / excutor 两个字段是否都为空
+            fresh_exec = fresh.get("executor")
+            fresh_exec_legacy = fresh.get("excutor")
+            exec_taken = (
+                (str(fresh_exec) if fresh_exec is not None else "").strip()
+                or (str(fresh_exec_legacy) if fresh_exec_legacy is not None else "").strip()
+            )
+            if fresh_status != TaskStatus.PENDING.value or exec_taken:
+                skipped_stale += 1
+                if sample_logged < 3:
+                    logger.info(
+                        f"[batch-claim] skip stale task_id={task_id} "
+                        f"status={fresh_status!r}(type={type(fresh_status).__name__}) "
+                        f"executor={fresh_exec!r} excutor={fresh_exec_legacy!r}"
+                    )
+                    sample_logged += 1
                 continue
         except Exception as e:
+            skipped_refresh_fail += 1
             logger.warning(f"[batch-claim] 刷新任务失败 {task_id}: {e}")
             continue
 
-        update_payload = {
+        update_payload: Dict[str, Any] = {
             "status": TaskStatus.PROCESSING.value,
             "executor": executor_address,
             "claimedAt": now_iso,
         }
+        # 对于历史 excutor="" 的数据，把它额外清为空串，避免前端误读存量旧字段
+        if "excutor" in task and not (task.get("excutor") or "").strip():
+            update_payload["excutor"] = ""
         try:
             await parse_client.update_object("AITask", object_id, update_payload)
         except Exception as e:
+            skipped_update_fail += 1
             logger.warning(f"[batch-claim] 认领失败 {task_id}: {e}")
             continue
 
@@ -1258,7 +1341,9 @@ async def batch_claim_tasks(
 
     logger.info(
         f"[batch-claim] user={user_id} executor={executor_address} "
-        f"requested={limit} claimed={len(claimed)}"
+        f"requested={limit} candidates={len(candidates)} claimed={len(claimed)} "
+        f"skipped_stale={skipped_stale} refresh_fail={skipped_refresh_fail} "
+        f"update_fail={skipped_update_fail} missing_id={skipped_missing_id}"
     )
 
     return BatchClaimResponse(
@@ -1306,17 +1391,29 @@ async def batch_complete_tasks(
     for item in completions:
         task_id = item.task_id
         try:
-            # 查询任务
-            query = await parse_client.query_objects("AITask", where={"taskId": task_id}, limit=1)
-            task_list = query.get("results", []) or []
-            if not task_list:
-                results.append(BatchCompleteItemResult(
-                    task_id=task_id, ok=False, status="SKIPPED", error="任务不存在"
-                ))
-                failed_count += 1
-                continue
+            # 任务查找策略：
+            # 1. 优先将 task_id 当作 Parse objectId 直接 get_object
+            #    （batch-claim 已统一返回 objectId，主键查询更快且无需扫描）
+            # 2. 若当作 objectId 找不到（老客户端已认领且 task_id 是旧的 taskId 字段值），
+            #    fallback 到 query_objects(where={"taskId": task_id})
+            task: Optional[Dict[str, Any]] = None
+            try:
+                task = await parse_client.get_object("AITask", task_id)
+            except Exception:
+                task = None
+            if not task:
+                query = await parse_client.query_objects(
+                    "AITask", where={"taskId": task_id}, limit=1
+                )
+                task_list = query.get("results", []) or []
+                if not task_list:
+                    results.append(BatchCompleteItemResult(
+                        task_id=task_id, ok=False, status="SKIPPED", error="任务不存在"
+                    ))
+                    failed_count += 1
+                    continue
+                task = task_list[0]
 
-            task = task_list[0]
             object_id = task["objectId"]
             current_status = task.get("status")
 
