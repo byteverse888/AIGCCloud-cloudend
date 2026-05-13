@@ -24,7 +24,7 @@ from app.core.security import (
     checksum_address,
     decode_access_token,
 )
-from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat, get_admin_user_id, get_operator_user_id
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.operation_log import log_operation
@@ -378,7 +378,7 @@ async def reset_password(request: SetNewPasswordRequest):
 @router.post("/change-password")
 async def change_password(
     request: ChangePasswordRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     修改登录密码
@@ -443,7 +443,7 @@ async def change_password(
 @router.post("/bind-web3")
 async def bind_web3_address(
     request: UserBindWeb3Request,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     绑定Web3地址到用户账号
@@ -501,7 +501,7 @@ async def verify_web3_address(address: str):
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user(user_id: str = Depends(get_current_user_id)):
+async def get_current_user(user_id: str = Depends(get_current_user_id_compat)):
     """
     获取当前用户信息
     """
@@ -527,7 +527,7 @@ async def get_current_user(user_id: str = Depends(get_current_user_id)):
 # ============ 支付密码 ============
 
 @router.get("/payment-password/status")
-async def get_payment_password_status(user_id: str = Depends(get_current_user_id)):
+async def get_payment_password_status(user_id: str = Depends(get_current_user_id_compat)):
     """查询当前用户是否已设置支付密码"""
     try:
         user = await parse_client.get_user(user_id)
@@ -539,7 +539,7 @@ async def get_payment_password_status(user_id: str = Depends(get_current_user_id
 @router.post("/payment-password")
 async def set_payment_password(
     request: SetPaymentPasswordRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     设置/修改支付密码。
@@ -581,7 +581,7 @@ async def set_payment_password(
 @router.post("/payment-password/verify")
 async def verify_payment_password(
     request: VerifyPaymentPasswordRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """校验支付密码（仅用于前端交互检查，支付接口会再次校验）"""
     try:
@@ -1117,7 +1117,7 @@ async def list_users(
 @router.post("/wallet/create")
 async def create_wallet(
     request: CreateWalletRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     创建钱包
@@ -1163,7 +1163,7 @@ async def create_wallet(
 @router.post("/wallet/import")
 async def import_wallet(
     request: ImportWalletRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     导入钱包
@@ -1209,7 +1209,7 @@ async def import_wallet(
 @router.post("/wallet/transfer")
 async def transfer(
     request: TransferRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     转账
@@ -1304,7 +1304,7 @@ async def transfer(
 
 @router.post("/wallet/unbind")
 async def unbind_wallet(
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     解绑钱包
@@ -1354,7 +1354,7 @@ class WithdrawRequestModel(BaseModel):
 @router.post("/withdraw")
 async def create_withdraw_request(
     request: WithdrawRequestModel,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     创建提现申请

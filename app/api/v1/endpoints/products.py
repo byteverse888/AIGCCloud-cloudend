@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from app.core.parse_client import parse_client
 from app.core.email_client import email_client
-from app.core.deps import get_current_user_id, get_admin_user_id, get_operator_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat, get_admin_user_id, get_operator_user_id
 from app.core.logger import logger
 
 router = APIRouter()
@@ -200,7 +200,7 @@ async def batch_review_products(
 @router.post("/report")
 async def report_product(
     request: ReportProductRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     举报商品

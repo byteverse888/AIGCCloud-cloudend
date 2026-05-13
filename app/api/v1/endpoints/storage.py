@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import uuid
 
 from app.core.config import settings
-from app.core.deps import get_current_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat
 
 router = APIRouter()
 
@@ -66,7 +66,7 @@ class BatchPresignedRequest(BaseModel):
 @router.post("/presign/upload", response_model=PresignedUploadResponse)
 async def get_presigned_upload_url(
     request: PresignedUploadRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     获取预签名上传URL
@@ -109,7 +109,7 @@ async def get_presigned_upload_url(
 @router.post("/presign/download", response_model=PresignedDownloadResponse)
 async def get_presigned_download_url(
     request: PresignedDownloadRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     获取预签名下载URL
@@ -139,7 +139,7 @@ async def get_presigned_download_url(
 @router.post("/presign/batch-upload")
 async def get_batch_presigned_upload_urls(
     request: BatchPresignedRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     批量获取预签名上传URL
@@ -188,7 +188,7 @@ async def get_batch_presigned_upload_urls(
 @router.delete("/file/{file_key:path}")
 async def delete_file(
     file_key: str,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     删除文件

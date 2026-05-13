@@ -9,7 +9,7 @@ import uuid
 
 from app.core.parse_client import parse_client
 from app.core.redis_client import redis_client
-from app.core.deps import get_current_user_id, get_operator_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat, get_operator_user_id
 from app.core.security import generate_order_no, verify_password
 from app.core.logger import logger
 from app.core.operation_log import log_operation
@@ -77,7 +77,7 @@ def _require_payment_password(user: dict, input_password: str) -> None:
 @router.post("/publish")
 async def publish_asset(
     request: AssetPublishRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """发布资产到商城"""
     logger.info(f"[资产发布] user_id={user_id}, name={request.name}")
@@ -122,7 +122,7 @@ async def get_my_assets(
     page: int = 1,
     limit: int = 20,
     status: Optional[str] = None,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """获取我的资产列表"""
     where = {"creatorId": user_id}
@@ -158,7 +158,7 @@ async def get_my_assets(
 async def get_purchased_assets(
     page: int = 1,
     limit: int = 20,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """获取我购买的资产"""
     skip = (page - 1) * limit
@@ -198,7 +198,7 @@ async def get_purchased_assets(
 # ============ 购物车接口（必须在 /{asset_id} 通配路由之前注册）============
 
 @router.get("/cart")
-async def get_cart(user_id: str = Depends(get_current_user_id)):
+async def get_cart(user_id: str = Depends(get_current_user_id_compat)):
     """获取购物车（容错：清理已删/下架的无效项）"""
     cart_key = f"cart:{user_id}"
     cart_data = await redis_client.get(cart_key)
@@ -261,7 +261,7 @@ async def get_cart(user_id: str = Depends(get_current_user_id)):
 @router.post("/cart")
 async def add_to_cart(
     request: AssetPurchaseRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """添加资产到购物车"""
     asset_id = request.asset_id
@@ -298,7 +298,7 @@ async def add_to_cart(
 
 
 @router.delete("/cart/{asset_id}")
-async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_user_id)):
+async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_user_id_compat)):
     """从购物车移除（幂等：购物车为空或项不存在也返回成功）"""
     cart_key = f"cart:{user_id}"
     cart_data = await redis_client.get(cart_key)
@@ -321,7 +321,7 @@ async def remove_from_cart(asset_id: str, user_id: str = Depends(get_current_use
 
 
 @router.get("/{asset_id}")
-async def get_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
+async def get_asset(asset_id: str, user_id: str = Depends(get_current_user_id_compat)):
     """获取资产详情"""
     try:
         asset = await parse_client.get_object("Product", asset_id)
@@ -360,7 +360,7 @@ async def get_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
 async def update_asset(
     asset_id: str,
     request: AssetUpdateRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """编辑AI资产（兼容 AIIPAsset / Product 两类 ID）"""
     # 先当作 AIIPAsset 查，回落 Product
@@ -427,7 +427,7 @@ async def update_asset(
 @router.post("/{asset_id}/submit")
 async def submit_for_review(
     asset_id: str,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """提交AI资产审核"""
     try:
@@ -478,7 +478,7 @@ async def submit_for_review(
 @router.post("/batch-submit")
 async def batch_submit_for_review(
     request: BatchSubmitRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     批量提交 AI 资产申请上架审核
@@ -584,7 +584,7 @@ async def batch_submit_for_review(
 
 
 @router.post("/{asset_id}/purchase")
-async def purchase_asset(asset_id: str, user_id: str = Depends(get_current_user_id)):
+async def purchase_asset(asset_id: str, user_id: str = Depends(get_current_user_id_compat)):
     """购买资产"""
     # 获取资产信息
     try:
@@ -653,7 +653,7 @@ async def purchase_asset(asset_id: str, user_id: str = Depends(get_current_user_
 async def purchase_asset_with_balance(
     asset_id: str,
     request: BalancePayRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     使用用户积分余额（totalIncentive）购买商品。
@@ -1045,7 +1045,7 @@ async def admin_asset_stats(operator_id: str = Depends(get_operator_user_id)):
 
 
 @router.post("/cart/checkout")
-async def checkout_cart(user_id: str = Depends(get_current_user_id)):
+async def checkout_cart(user_id: str = Depends(get_current_user_id_compat)):
     """购物车结算"""
     cart_key = f"cart:{user_id}"
     cart_data = await redis_client.get(cart_key)
@@ -1094,7 +1094,7 @@ async def checkout_cart(user_id: str = Depends(get_current_user_id)):
 @router.post("/cart/checkout-with-balance")
 async def checkout_cart_with_balance(
     request: BalancePayRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     使用账户积分余额结算购物车（批量支付）。

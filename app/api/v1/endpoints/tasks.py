@@ -14,7 +14,7 @@ from botocore.config import Config
 from app.core.parse_client import parse_client
 from app.core.web3_client import web3_client
 from app.core.security import generate_task_id
-from app.core.deps import get_current_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat
 from app.core.deps import get_admin_user_id, get_operator_user_id
 from app.core.config import settings
 from app.core.incentive_service import incentive_service
@@ -115,7 +115,7 @@ async def process_ai_task(task_id: str, task_type: str, model: str, data: Dict[s
 async def submit_task(
     request: SubmitTaskRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     提交AI生成任务
@@ -193,7 +193,7 @@ async def submit_task(
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
-async def get_task(task_id: str, user_id: str = Depends(get_current_user_id)):
+async def get_task(task_id: str, user_id: str = Depends(get_current_user_id_compat)):
     """
     获取任务状态
     """
@@ -230,7 +230,7 @@ async def get_user_tasks(
     limit: int = 20,
     type: Optional[str] = None,
     status: Optional[int] = None,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     获取用户的任务列表
@@ -505,7 +505,7 @@ async def update_task_status(
 
 
 @router.delete("/{task_id}")
-async def cancel_task(task_id: str, user_id: str = Depends(get_current_user_id)):
+async def cancel_task(task_id: str, user_id: str = Depends(get_current_user_id_compat)):
     """
     取消任务(仅排队中的任务可取消)
     """
@@ -555,7 +555,7 @@ async def cancel_task(task_id: str, user_id: str = Depends(get_current_user_id))
 async def retry_task(
     task_id: str,
     background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     重试失败任务
@@ -1007,7 +1007,7 @@ def _map_type_to_category(task_type: str) -> str:
 @router.post("/ai-task/{task_id}/convert")
 async def convert_task_to_asset(
     task_id: str,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """将AIGC任务的所有已完成结果转换为AI资产（支持多结果 + 幂等）"""
     # 先按业务 taskId 查，查不到再按 Parse objectId 查找（兼容旧数据/taskId 缺失场景）
@@ -1177,7 +1177,7 @@ class BatchCompleteResponse(BaseModel):
 @router.post("/node/batch-claim", response_model=BatchClaimResponse)
 async def batch_claim_tasks(
     request: BatchClaimRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     边缘节点批量认领任务
@@ -1356,7 +1356,7 @@ async def batch_claim_tasks(
 @router.post("/node/batch-complete", response_model=BatchCompleteResponse)
 async def batch_complete_tasks(
     request: BatchCompleteRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     边缘节点批量回传任务完成状态

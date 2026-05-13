@@ -154,3 +154,36 @@ async def get_optional_parse_user(
         return await parse_client.get_current_user(parse_session)
     except Exception:
         return None
+
+
+# ============ 兼容鉴权 (Session Token 与 Bearer JWT 任一) ============
+
+async def get_current_user_id_compat(
+    parse_session: Optional[str] = Header(None, alias="X-Parse-Session-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> str:
+    """
+    双轨鉴权：优先 Parse Session Token，其次 Bearer JWT。
+    适用于同时服务 sessionToken 客户端与 JWT 客户端的端点。
+    """
+    # 1) Parse Session Token
+    if parse_session:
+        try:
+            user = await parse_client.validate_session(parse_session)
+            uid = user.get("objectId") or user.get("id")
+            if uid:
+                return uid
+        except Exception:
+            pass  # 回落到 JWT
+    
+    # 2) Bearer JWT
+    if authorization:
+        token = authorization[7:] if authorization.startswith("Bearer ") else authorization
+        uid = verify_jwt_token(token)
+        if uid:
+            return uid
+    
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="未提供有效的会话令牌或访问令牌",
+    )

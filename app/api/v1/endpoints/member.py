@@ -5,14 +5,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, Request
 from pydantic import BaseModel
 
 from app.core.logger import logger
 from app.core.parse_client import parse_client
 from app.core.wechat_pay import wechat_pay, MEMBER_PLANS
 from app.core.incentive_service import incentive_service
-from app.core.deps import get_current_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat
 
 router = APIRouter()
 
@@ -81,7 +81,7 @@ async def get_member_plans():
 @router.post("/subscribe", response_model=SubscribeResponse)
 async def subscribe_member(
     request: SubscribeRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     创建会员订阅订单
@@ -121,13 +121,14 @@ async def subscribe_member(
     current_priority = LEVEL_PRIORITY.get(current_level, 0)
     new_priority = LEVEL_PRIORITY.get(new_level, 0)
     
-    # 检查当前会员是否有效
+    # 检查当前会员是否有效（统一用 aware datetime 比较，避免 offset-naive/aware 混比）
     is_active = False
+    expire_dt = None
     if current_expire:
         try:
             expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
-            if expire_dt.tzinfo:
-                expire_dt = expire_dt.replace(tzinfo=None)
+            if expire_dt.tzinfo is None:
+                expire_dt = expire_dt.replace(tzinfo=timezone.utc)
             is_active = expire_dt > datetime.now(timezone.utc)
         except Exception as e:
             logger.warning(f"[会员订阅] 解析到期时间失败: {e}")
@@ -229,12 +230,19 @@ async def simulate_pay(request: SimulatePayRequest):
 
 
 @router.post("/callback/wechat")
-async def wechat_callback(request_body: str):
+async def wechat_callback(request: Request):
     """
     微信支付回调
     
-    微信服务器通知支付结果
+    微信服务器通知支付结果（请求体为 XML，需从 raw body 读取）
     """
+    try:
+        body_bytes = await request.body()
+        request_body = body_bytes.decode("utf-8", errors="ignore")
+    except Exception as e:
+        logger.error(f"[微信回调] 读取 body 失败: {e}")
+        return "<xml><return_code>FAIL</return_code><return_msg>body读取失败</return_msg></xml>"
+    
     # 验证回调
     verify_result = wechat_pay.verify_callback(request_body)
     if not verify_result.get("success"):
@@ -267,7 +275,7 @@ async def wechat_callback(request_body: str):
 @router.get("/status/{user_id}", response_model=MemberStatusResponse)
 async def get_member_status(
     user_id: str,
-    current_user_id: str = Depends(get_current_user_id),
+    current_user_id: str = Depends(get_current_user_id_compat),
 ):
     """获取用户会员状态"""
     # 通过 JWT 认证验证用户身份
@@ -303,7 +311,7 @@ async def get_member_orders(
     user_id: str,
     limit: int = 20,
     skip: int = 0,
-    current_user_id: str = Depends(get_current_user_id),
+    current_user_id: str = Depends(get_current_user_id_compat),
 ):
     """获取用户会员订单列表"""
     # 通过 JWT 认证验证用户身份
@@ -324,7 +332,7 @@ async def get_member_orders(
 @router.get("/order-status/{order_id}")
 async def get_order_status(
     order_id: str,
-    current_user_id: str = Depends(get_current_user_id),
+    current_user_id: str = Depends(get_current_user_id_compat),
 ):
     """
     查询订单支付状态（用于支付后轮询）
@@ -473,12 +481,16 @@ async def complete_member_order(order_id: str, order: dict) -> SubscribeResponse
         
         now = datetime.now(timezone.utc)
         is_active = False
+        expire_dt = None
         
         if current_expire:
-            expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
-            if expire_dt.tzinfo:
-                expire_dt = expire_dt.replace(tzinfo=None)
-            is_active = expire_dt > now
+            try:
+                expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
+                if expire_dt.tzinfo is None:
+                    expire_dt = expire_dt.replace(tzinfo=timezone.utc)
+                is_active = expire_dt > now
+            except Exception as e:
+                logger.warning(f"[会员订单] 解析到期时间失败: {e}")
         
         # 检查是否为降级购买
         if is_active and new_priority < current_priority:

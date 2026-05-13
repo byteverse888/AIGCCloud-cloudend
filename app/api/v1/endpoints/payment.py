@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from app.core.parse_client import parse_client
 from app.core.web3_client import web3_client
 from app.core.security import generate_order_no
-from app.core.deps import get_current_user_id, get_optional_parse_user
+from app.core.deps import get_current_user_id, get_current_user_id_compat, get_optional_parse_user
 from app.core.config import settings
 from app.core.incentive_service import incentive_service
 from app.core.redis_client import redis_client
@@ -232,7 +232,7 @@ async def get_user_orders(
     page: int = 1,
     limit: int = 20,
     status: Optional[str] = None,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """获取用户订单列表"""
     where = {"userId": user_id}

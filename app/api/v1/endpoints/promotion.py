@@ -8,7 +8,7 @@ from datetime import datetime
 
 from app.core.parse_client import parse_client
 from app.core.web3_client import web3_client
-from app.core.deps import get_current_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat
 from app.core.config import settings
 from app.core.incentive_service import incentive_service, INCENTIVE_CONFIG
 
@@ -38,7 +38,7 @@ class InviteRecord(BaseModel):
 # ============ 端点 ============
 
 @router.get("/link")
-async def get_promotion_link(user_id: str = Depends(get_current_user_id)):
+async def get_promotion_link(user_id: str = Depends(get_current_user_id_compat)):
     """
     获取用户的推广链接
     """
@@ -57,7 +57,7 @@ async def get_promotion_link(user_id: str = Depends(get_current_user_id)):
 
 
 @router.get("/stats", response_model=PromotionStats)
-async def get_promotion_stats(user_id: str = Depends(get_current_user_id)):
+async def get_promotion_stats(user_id: str = Depends(get_current_user_id_compat)):
     """
     获取用户的推广统计
     """
@@ -94,7 +94,7 @@ async def get_promotion_stats(user_id: str = Depends(get_current_user_id)):
 async def get_promotion_records(
     page: int = 1,
     limit: int = 20,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     获取推广记录列表
@@ -172,7 +172,7 @@ async def get_promotion_leaderboard(limit: int = 10):
 @router.post("/bind-inviter")
 async def bind_inviter(
     invite_code: str,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     绑定邀请人(注册后补绑定)

@@ -9,7 +9,7 @@ from datetime import datetime
 from app.core.parse_client import parse_client
 from app.core.redis_client import redis_client
 from app.core.web3_client import web3_client
-from app.core.deps import get_current_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat
 from app.core.incentive_service import incentive_service
 from app.core.logger import logger
 
@@ -31,7 +31,7 @@ async def get_incentive_history(
     type: Optional[str] = None,
     exclude_type: Optional[str] = None,
     category: Optional[str] = None,
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_compat)
 ):
     """
     获取用户账户积分流水（AccountRecord 统一账本）
@@ -80,7 +80,7 @@ async def get_incentive_history(
 
 
 @router.get("/balance")
-async def get_balance(user_id: str = Depends(get_current_user_id)):
+async def get_balance(user_id: str = Depends(get_current_user_id_compat)):
     """
     获取用户余额
     - 账户积分（totalIncentive）始终返回
@@ -118,7 +118,7 @@ async def get_balance(user_id: str = Depends(get_current_user_id)):
 
 
 @router.get("/account-balance")
-async def get_account_balance(user_id: str = Depends(get_current_user_id)):
+async def get_account_balance(user_id: str = Depends(get_current_user_id_compat)):
     """获取用户当前账户积分余额（totalIncentive）"""
     try:
         user = await parse_client.get_user(user_id)
@@ -131,7 +131,7 @@ async def get_account_balance(user_id: str = Depends(get_current_user_id)):
 # ============ 每日签到 ============
 
 @router.post("/daily-sign")
-async def daily_sign(user_id: str = Depends(get_current_user_id)):
+async def daily_sign(user_id: str = Depends(get_current_user_id_compat)):
     """每日签到，发放账户积分（日级幂等）"""
     result = await incentive_service.grant_daily_sign_reward(user_id)
     if not result.get("success"):
@@ -142,7 +142,7 @@ async def daily_sign(user_id: str = Depends(get_current_user_id)):
 
 
 @router.get("/daily-sign/status")
-async def daily_sign_status(user_id: str = Depends(get_current_user_id)):
+async def daily_sign_status(user_id: str = Depends(get_current_user_id_compat)):
     """查询今日是否已签到 + 连续签到天数"""
     today = datetime.now().strftime("%Y-%m-%d")
     try:
@@ -181,7 +181,7 @@ async def get_exchange_rate():
 @router.post("/exchange-to-web3")
 async def exchange_to_web3(
     request: ExchangeRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """账户积分 → 链上金币"""
     result = await incentive_service.exchange_to_web3(user_id, float(request.amount))
@@ -193,7 +193,7 @@ async def exchange_to_web3(
 @router.post("/exchange-to-balance")
 async def exchange_to_balance(
     request: ExchangeRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
 ):
     """链上金币 → 账户积分"""
     result = await incentive_service.exchange_to_balance(user_id, float(request.amount))
@@ -203,7 +203,7 @@ async def exchange_to_balance(
 
 
 @router.get("/stats")
-async def get_incentive_stats(user_id: str = Depends(get_current_user_id)):
+async def get_incentive_stats(user_id: str = Depends(get_current_user_id_compat)):
     """
     获取账户积分统计
     - coins / web3_address：链上余额

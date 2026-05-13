@@ -26,7 +26,7 @@ from app.core.config import settings
 from app.core.logger import logger
 from app.core.rate_limit import login_rate_limit, register_rate_limit, sms_rate_limit
 from app.core.operation_log import log_operation
-from app.core.deps import get_current_user_id
+from app.core.deps import get_current_user_id, get_current_user_id_compat
 
 router = APIRouter()
 
@@ -635,7 +635,7 @@ async def email_login(request: EmailLoginRequest):
 @router.post("/logout")
 async def logout(
     http_request: Request,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id_compat),
     parse_session: Optional[str] = Header(None, alias="X-Parse-Session-Token")
 ):
     """
